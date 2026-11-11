@@ -1,19 +1,163 @@
 # Architecture
 
-A small modular Python CLI: Pydantic validates and normalizes input, YAML maps CSV headers, Typer exposes operations, and standard-library CSV/SQLite/locking provide persistence. Core ingestion/tracking has no outbound HTTP calls or external services. An optional, explicitly invoked Codex subprocess can research public web sources; it returns structured evidence to the local application.
+A signal-based GTM engine that finds B2B SaaS buyers with a fresh reason to talk, turns
+them into a reliable work queue, and runs human-approved outreach. I use it on my own
+remote job and contract search; it is built so a startup can swap in its own sources,
+enrichment vendors, sending tools, and CRM.
 
-`Grok / authorized LinkedIn CSV → normalize → match → atomic master CSV → daily follow-up view`
+**Status legend:** ✅ built and tested · 🟡 in progress · ⬜ planned
 
-The primary data lives in `data/prospects.csv`. One row represents one person; company name/domain stay on that row. `sources` and `objectives` are pipe-separated sets; `original_source` retains first acquisition. Consulting and remote-job stages are independent columns. Activity history and source observations are JSON lists in protected columns, not separate databases. Extra source fields are also projected as ordinary columns for spreadsheet use. New observations fill blank fields and append notes; existing manual edits and nonempty identity fields win.
+## ICP
 
-Match by exact normalized email or LinkedIn URL. If identifiers disagree or identify multiple rows, hold for manual review. Name plus company/domain only suggests a duplicate and never auto-merges. A brand-new person with no strong identity is captured with `needs_review=true`; repeat ingestion of the exact row cannot duplicate them because observation fingerprints are saved in the same master write. Syntax validation does not verify emails or company ownership. No domain-verification input is required for local capture.
+| Segment | Who | Signals that qualify them |
+|---|---|---|
+| Founders | Founder, Co-founder, CEO at seed–Series B B2B SaaS | New funding, launch, first GTM hire, pipeline/outbound pain posted publicly |
+| GTM leaders | Head-level and C-suite in **marketing, content, or sales**: CMO, CRO, Chief Growth/Content/Commercial, VP or Head of Marketing, Sales, Content, Growth, Demand, Revenue, GTM | New in role, team expansion, GTM Engineer / RevOps / Marketing Ops job post |
 
-Every importer/manual CLI mutation holds a local advisory writer lock associated with its SQLite state path. Use one project/state path and one Mac; external spreadsheet applications do not honor this lock. Save and close the spreadsheet before writes. The whole master is rewritten through a private temporary file, flush/fsync, and atomic replace. Before each replacement the old master is backed up in `data/backups/`. Unknown user-added columns are retained. Invalid headers, dates, identities, JSON history, or duplicate IDs stop ingestion instead of destroying the file.
+Excluded: individual contributors, Directors and below, SDRs/AEs, investors.
+Encoded in [`docs/grok-brief.md`](grok-brief.md) (sourcing) and `config/gtm.yaml`
+(`decision_maker_rule`: seniority × function).
 
-SQLite stores fingerprints, row outcomes, run history, snapshot references, and audit metadata only. It has no prospect table. Each row commits to CSV before its operational checkpoint; after a crash, the observation in the master prevents another create. Successful rows survive subsequent row failures. Originals remain in the inbox; managed snapshots move through processing, processed, and failed directories. The existing stable-file detection, snapshot recovery, and LaunchAgent logic are retained.
+## Pipeline
 
-Follow-up actions are derived from actual dates/statuses in the master. A stable hash of person/rule/trigger date identifies each action; completion IDs are stored in the same master. Seven-day pending reviews, first-conversation reminders, reply reminders, and explicit due dates are supported. DNC/closed people generate no outreach actions. These reminders do not imply a message was sent. This local version intentionally omits CRM schema management, remote synchronization, enrichment, and separate multi-contact opportunity entities.
+```mermaid
+flowchart LR
+    subgraph S[1 · Sources]
+        G[Grok daily signals<br/>25 founders + 25 GTM leaders]
+        L[LinkedIn manual export]
+        H[Hiring-signal feeds]
+    end
+    subgraph I[2 · Ingest]
+        N[Normalize · validate · fingerprint]
+        M[Identity match + review queue]
+    end
+    subgraph E[3 · Enrich]
+        W[Waterfall: LinkedIn URL → work email → verify]
+    end
+    subgraph R[4 · Research & Score]
+        A[Account research agent<br/>cited evidence receipts]
+        P[Versioned Python score policy<br/>Tier 1 / 2 / 3]
+    end
+    subgraph O[5 · Outbound]
+        D[Draft sequence from signal + angle]
+        Q[Human approval queue]
+        X[Send: email tool / LinkedIn by hand]
+    end
+    subgraph T[6 · Track]
+        Y[Reply + acceptance detection]
+        F[Follow-up actions]
+    end
+    subgraph V[7 · Report]
+        B[Funnel dashboard + portfolio metrics]
+    end
+    G --> N
+    L --> N
+    H -.-> N
+    N --> M --> W --> A --> P --> D --> Q --> X --> Y --> F
+    Y --> P
+    P --> B
+    Y --> B
+```
 
-## Research boundary
+| Stage | What it does | Status |
+|---|---|---|
+| 1 Sources | Grok scheduled task drops dated CSVs into `data/incoming/grok/{founders,VPs}/`; LinkedIn CSVs into `data/incoming/linkedin/` | ✅ Grok, LinkedIn · ⬜ hiring-signal feeds |
+| 2 Ingest | Header mapping, Pydantic validation, content fingerprints so reruns never duplicate, deterministic identity match (email / LinkedIn URL), ambiguous matches held for review | ✅ |
+| 3 Enrich | Fill missing LinkedIn URL and work email through a provider waterfall (Clay → Vibe Prospecting → manual), verify email deliverability, record which provider supplied each field | ⬜ next |
+| 4 Research & Score | Optional agent researches each **account** once and returns cited evidence; fixed Python policy computes account fit, lead fit, intent, engagement → tier and next action. Missing evidence stays unscored, never guessed | ✅ policy and receipts · 🟡 automatic research of new accounts |
+| 5 Outbound | Generate a 3-touch email sequence and a LinkedIn connection note from each person's `signal` and `outreach_angle`; nothing sends without approval | ⬜ |
+| 6 Track | Replies and connection acceptance update status, engagement score, and follow-up dates; DNC and closed people get no actions | ✅ manual logging and follow-ups · ⬜ automatic reply detection |
+| 7 Report | Aggregate funnel metrics without exposing prospect data | ✅ `gtm portfolio-report` · ⬜ live dashboard |
 
-Account-level JSON research receipts are local source evidence, not another CRM. The master CSV still owns contact data and manual events. Fixed Python policy computes numeric scores from AI-assisted, cited findings; no per-row model-generated weights. Full-time/contract eligibility are independent. Missing evidence stays unscored, and profile changes invalidate cached judgments. Derived score columns refresh on writes and daily views calculate freshness again. See [research/scoring](scoring-and-research.md).
+## Components and adapters
+
+The core never calls a vendor directly. Each external system sits behind a small
+interface, so a startup can replace any box without touching the pipeline.
+
+```mermaid
+flowchart TB
+    Core[Core pipeline<br/>ingest · match · score · actions]
+    Core --- SRC[Source]
+    Core --- ENR[Enricher]
+    Core --- RES[Researcher]
+    Core --- SND[Sender]
+    Core --- CRM[CRM sync]
+    SRC --- s1[Grok CSV ✅] & s2[LinkedIn CSV ✅] & s3[Job boards ⬜]
+    ENR --- e1[Clay ⬜] & e2[Vibe Prospecting ⬜]
+    RES --- r1[Codex/LLM agent ✅]
+    SND --- d1[Gmail drafts ⬜] & d2[Instantly / Smartlead ⬜]
+    CRM --- c1[CSV master ✅] & c2[HubSpot / Attio ⬜]
+```
+
+| Interface | Contract |
+|---|---|
+| `Source` | Yields raw rows plus a stable file fingerprint |
+| `Enricher` | Given a person, returns fields found with provider name and confidence; never overwrites manual edits |
+| `Researcher` | Given a company domain, returns a structured, cited receipt validated against a JSON schema |
+| `Sender` | Creates drafts or enqueues approved messages; returns external message IDs for reply matching |
+| `CRM` | Exports the person row and activity history; the engine stays the system of record for scoring |
+
+## Data model
+
+| Store | Holds | Notes |
+|---|---|---|
+| `data/prospects.csv` | One row per person: identity, company, signal, stages, scores, activity history | Editable in Excel/Numbers; atomic writes; last 30 versions in `data/backups/` |
+| `data/state/local.sqlite` | Import runs, file/row fingerprints, outcomes, audit metadata | No contact data |
+| `data/research/` | Per-account evidence receipts and history | Shared by every contact at the account |
+| `config/gtm.yaml` | Header mappings, stages, follow-up cadence, ICP rule, score weights | Versioned with the code |
+
+Two pipelines run on the same person row and do not interfere: `consulting_stage`
+(identified → won/lost) and `job_stage` (identified → hired/rejected).
+
+**Planned change:** move the system of record into SQLite (Postgres for multi-user) and
+treat the CSV as an export and editing view. This removes the rule that the spreadsheet
+must be closed during imports and is the prerequisite for team use.
+
+## Outbound design (planned)
+
+- **Email:** 3 touches over ~10 days. Touch 1 references the signal; touch 2 adds one
+  relevant proof point; touch 3 is a short close-the-loop. Sent from a secondary, warmed
+  domain at 30–50 per inbox per day.
+- **LinkedIn:** the system writes the connection note; I send it by hand, 15–20 per day.
+  No LinkedIn automation.
+- **Approval:** drafts land in a queue (Gmail drafts or the sending tool) and go out only
+  after review. The LLM never marks a message as sent or invents a reply.
+- **Reply detection:** poll the inbox, match by message ID, set `connection_status`,
+  update engagement score, and stop the sequence.
+
+## Scheduling
+
+| Job | Today | Planned |
+|---|---|---|
+| Grok sourcing | Grok scheduled task | same |
+| Import | macOS LaunchAgent every 15 min (`gtm scheduler install`) | GitHub Actions cron |
+| Enrichment + research of new accounts | manual | nightly after import |
+| Draft generation | — | nightly, into approval queue |
+| Reply sync | — | every 30 min |
+| Daily briefing | `gtm daily` | pushed to email or Slack |
+
+## Guarantees
+
+- **Idempotent imports.** Files and rows are fingerprinted; rerunning or re-dropping the
+  same file never creates duplicates. Originals stay untouched in the inbox.
+- **Crash-safe writes.** Master is written to a temp file, fsynced, and atomically
+  replaced, with a backup taken first. Each row is committed to the CSV before its
+  checkpoint, so a crash can't double-create.
+- **Conservative identity.** Only exact email or normalized LinkedIn URL auto-merge.
+  Name + company only suggests a duplicate for review.
+- **Manual edits win.** New observations fill blanks and append notes; they never
+  overwrite user-entered values.
+- **Explainable scores.** The model gathers cited evidence; fixed, versioned Python rules
+  compute the score. Profile or policy changes invalidate cached judgments.
+- **Humans own outcomes.** Replies, acceptances, and sends are observed events, never
+  model output. DNC excludes a person from all actions.
+- **Private by default.** Prospect data, state, research, and `.env` are git-ignored; the
+  portfolio report exports aggregates only.
+
+## Roadmap
+
+1. ✅ Repo, backup rotation, file-naming contract, Grok brief, ICP rule
+2. ⬜ Enrichment waterfall (Clay, Vibe Prospecting) with provenance and email verification
+3. ⬜ Outbound drafts, approval queue, reply detection
+4. ⬜ SQLite system of record; GitHub Actions scheduling
+5. ⬜ Demo mode with synthetic data, live funnel dashboard, walkthrough video
