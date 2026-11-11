@@ -1,0 +1,71 @@
+followups:
+  pending_days: 7
+  proposal_days: 5
+  outreach_days: 4
+pipelines:
+  consulting_client: [identified, qualified, contacted, engaged, discovery_scheduled, discovery_completed, proposal_sent, negotiation, won, lost, nurture]
+  remote_job: [identified, role_researched, contacted, replied, application_submitted, interview_scheduled, interviewing, offer, hired, rejected, nurture]
+  closed: [won, lost, hired, rejected]
+# Canonical field -> accepted input headers. Header matching is case insensitive.
+mappings:
+  grok:
+    full_name: [full_name, name, contact name]
+    email: [email, work email]
+    email_verified: [email_verified, verified]
+    linkedin_url: [linkedin_url, linkedin, linkedin profile url]
+    company_name: [company_name, company, account]
+    domain: [domain, company domain]
+    domain_verified: [domain_verified, company domain verified]
+    website: [website, company website, company_website]
+    job_title: [job_title, title, job title]
+    discovered_at: [discovered_at, discovery date]
+    external_id: [external_id, id]
+    objective: [objective, campaign]
+    create_opportunity: [create_opportunity]
+    opportunity_stage: [opportunity_stage]
+    icp_segment: [icp_segment, segment]
+    notes: [notes]
+  linkedin:
+    full_name: [full_name, name, full name]
+    email: [email, email address]
+    email_verified: [email_verified]
+    linkedin_url: [linkedin_url, url, linkedin profile url]
+    company_name: [company_name, company]
+    domain: [domain, company domain]
+    domain_verified: [domain_verified, company domain verified]
+    website: [website, company website, company_website]
+    job_title: [job_title, position, job title]
+    discovered_at: [discovered_at, discovery date]
+    connection_status: [connection_status, status]
+    connection_request_at: [connection_request_at, connection request date]
+    last_contact_at: [last_contact_at, last contact date]
+    next_followup_at: [next_followup_at, next follow-up date]
+    objective: [objective, campaign]
+    create_opportunity: [create_opportunity]
+    opportunity_stage: [opportunity_stage]
+    icp_segment: [icp_segment, segment]
+    notes: [notes]
+# Exploratory opportunity-priority policy; not a hiring probability model.
+scoring:
+  model_version: technical-marketing-v1
+  profile:
+    goal: remote_full_time_or_contract
+    positioning: Technical builder for marketing and growth teams
+    target_roles: [GTM Engineer, Growth Engineer, Marketing Engineer]
+    technical_work: [API integrations, workflow automation, CRM engineering, data pipelines, Python or SQL, marketing systems, AI-assisted marketing workflows]
+    exclude_roles: [generic AI Engineer, generic Software Engineer, growth strategist, paid-media manager, copywriter, Head of Growth, revenue leader]
+    strategy_preference: technical_execution_over_business_strategy
+    work_location: unspecified
+    remote_requirement: Confirm worldwide eligibility or leave geography uncertain until location is supplied
+    skill_evidence_urls: []
+  research_max_age_days: 30
+  engagement_max_age_days: 30
+  tier1_min: 70
+  tier2_min: 40
+  weights:
+    account_fit: {strong: 40, moderate: 20, weak: 0}
+    lead_fit: {decision_maker: 10, relevant: 5, other: 0}
+    intent: {strong: 30, moderate: 15, none: 0}
+    engagement: {positive_reply: 20, replied: 15, connected: 10, none: 0}
+  decision_maker_titles: [founder, ceo, chief executive, vp of marketing, vp marketing, vice president of marketing, head of marketing, hiring manager]
+  relevant_titles: [marketing, growth, revenue operations, revops, recruiter, talent]

@@ -1,0 +1,9 @@
+Name,Work Email,Verified,LinkedIn,Company,Company Domain,Company Domain Verified,Title,Discovery Date,External ID
+Alex Example,alex@aurora.example,true,linkedin.com/in/automation-alex,Aurora Synthetic,WWW.AURORA.EXAMPLE,true,Founder,2026-10-01T09:00:00Z,auto-alex
+Blair Example,blair@aurora.example,true,linkedin.com/in/automation-blair,Aurora Synthetic,aurora.example,true,VP Marketing,2026-10-01T09:01:00Z,auto-blair
+Casey Example,,,linkedin.com/in/automation-casey,Boreal Synthetic,boreal.example,true,Hiring Manager,2026-10-01T09:02:00Z,auto-casey
+Drew Example,drew@synthetic.example,true,,,,,Founder,2026-10-01T09:03:00Z,auto-drew
+Morgan MissingDomain,morgan@synthetic.example,true,,Unknown Synthetic,,,Founder,2026-10-01T09:04:00Z,auto-morgan
+Unverified Person,unverified@synthetic.example,true,,Dubious Synthetic,dubious.example,false,Founder,2026-10-01T09:05:00Z,auto-unverified
+No Identity,,,,Aurora Synthetic,aurora.example,true,Founder,2026-10-01T09:06:00Z,auto-missing-id
+,invalid@synthetic.example,true,,,,,Founder,2026-10-01T09:07:00Z,auto-invalid

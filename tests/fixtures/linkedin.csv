@@ -1,0 +1,6 @@
+Full Name,LinkedIn Profile URL,Company,Company Domain,Job Title,Objective,Discovery Date,Status,Connection Request Date,Notes,domain_verified,create_opportunity,opportunity_stage
+Alex Example,https://linkedin.com/in/alex-synthetic/?trk=manual,Aurora Synthetic,WWW.AURORA.EXAMPLE,Founder,remote_job,2026-10-02,connection_pending,2026-10-03,Interested in a remote role at the same account,true,true,identified
+Blair Example,https://www.linkedin.com/in/blair-synthetic,Aurora Synthetic,aurora.example,VP Marketing,consulting_client,2026-10-02,connected,,Manual acceptance observed,true,true,identified
+Casey Example,https://www.linkedin.com/in/casey-synthetic,Boreal Synthetic,boreal.example,Hiring Manager,remote_job,2026-10-02,connected,,No email required,true,true,identified
+Kai Example,https://www.linkedin.com/in/kai-synthetic,Iris Synthetic,iris.example,Founder,consulting_client,2026-10-02,connection_pending,2026-10-03,Manual request,true,true,identified
+Logan Example,https://www.linkedin.com/in/logan-synthetic,Juniper Synthetic,juniper.example,VP Marketing,consulting_client,2026-10-02,discovered,,Manual capture,true,true,identified

@@ -1,0 +1,4 @@
+full_name,email,email_verified,linkedin_url,company_name,domain,domain_verified,job_title,discovered_at,external_id,notes
+Alex Example,alex@aurora.example,true,linkedin.com/in/automation-alex,Aurora Synthetic,aurora.example,true,CTO,2026-10-02T09:00:00Z,auto-alex,Second source file with lower-confidence title
+Hayden Example,hayden@aurora.example,true,linkedin.com/in/automation-hayden,Aurora Synthetic,aurora.example,true,Founder,2026-10-02T09:01:00Z,auto-hayden,
+Jordan Example,,,linkedin.com/in/automation-jordan,Boreal Synthetic,boreal.example,true,Hiring Manager,2026-10-02T09:02:00Z,auto-jordan,
