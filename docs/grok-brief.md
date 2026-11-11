@@ -5,7 +5,7 @@ contract for `gtm import grok`; keep it versioned with the code.
 
 ## Prompt
 
-> Find **25 founders** and **25 marketing leaders** at B2B SaaS companies who show a
+> Find **25 founders** and **25 GTM leaders** at B2B SaaS companies who show a
 > fresh buying or hiring signal for GTM engineering work. Return two CSV files.
 >
 > **Segment A — founders** (file `founders/YYYY-MM-DD_founders.csv`)
@@ -13,13 +13,16 @@ contract for `gtm import grok`; keep it versioned with the code.
 >   they are the only founder.
 > - Company: B2B SaaS, roughly seed to Series B, 5–200 employees.
 >
-> **Segment B — marketing leaders** (file `VPs/YYYY-MM-DD_vps.csv`)
-> - Title must contain one of: VP Marketing, VP of Marketing, Head of Marketing,
->   Head of Growth, CMO, VP Demand Generation, Director of Marketing.
-> - Do **not** include sales titles (CRO, VP Sales, Head of Sales) or investors.
+> **Segment B — GTM leaders** (file `VPs/YYYY-MM-DD_vps.csv`)
+> - Head-level or C-suite in **marketing, content, or sales**. Accept: CMO, CRO,
+>   Chief Growth/Content/Commercial Officer, VP or Head of Marketing, Sales, Growth,
+>   Demand Generation, Content, Revenue, or GTM.
+> - Do **not** include individual contributors, managers below Head level,
+>   Directors, account executives/SDRs, or investors (VCs, partners at funds).
+> - Aim for a rough mix: about half marketing/content, half sales/revenue.
 >
-> **Signals (must be within the last 30 days):** new funding, new marketing/GTM
-> leader hired, job post for GTM Engineer / Growth Engineer / Marketing Ops / RevOps,
+> **Signals (must be within the last 30 days):** new funding, new marketing, content,
+> or sales leader hired, job post for GTM Engineer / Growth Engineer / Marketing Ops / RevOps,
 > product launch, public post about pipeline, outbound, or tooling problems.
 >
 > **Required for every row:** `linkedin_url` (the person's /in/ profile, not the

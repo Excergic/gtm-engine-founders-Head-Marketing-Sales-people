@@ -1,7 +1,7 @@
 [project]
 name = "personal-gtm-os"
 version = "0.2.0"
-description = "Local CSV prospect tracker for a solo operator"
+description = "GTM engine: signal-based prospecting of B2B SaaS founders and marketing, content and sales leaders"
 requires-python = ">=3.12"
 dependencies = ["pydantic>=2.9,<3", "typer>=0.12,<1", "PyYAML>=6,<7", "python-dotenv>=1,<2"]
 

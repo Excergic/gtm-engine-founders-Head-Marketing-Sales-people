@@ -67,5 +67,12 @@ scoring:
     lead_fit: {decision_maker: 10, relevant: 5, other: 0}
     intent: {strong: 30, moderate: 15, none: 0}
     engagement: {positive_reply: 20, replied: 15, connected: 10, none: 0}
-  decision_maker_titles: [founder, ceo, chief executive, vp of marketing, vp marketing, vice president of marketing, head of marketing, hiring manager]
-  relevant_titles: [marketing, growth, revenue operations, revops, recruiter, talent]
+  # ICP: founders plus Head-level and C-suite leaders in marketing, content, and sales.
+  decision_maker_titles: [founder, ceo, chief executive, president, chief marketing, cmo, chief revenue, cro, chief sales, chief growth, chief content, chief commercial, chief customer, vp of marketing, vp marketing, vice president of marketing, vp of sales, vp sales, vice president of sales, vp of content, vp content, vp of growth, vp growth, vp demand, vp revenue, head of marketing, head of sales, head of content, head of growth, head of demand, head of revenue, head of gtm, head of go-to-market, hiring manager]
+  # Seniority x function rule catches variants like "SVP Global Sales" or "VP of Product Marketing".
+  decision_maker_rule:
+    seniority: [vp, svp, evp, vice president, head, chief]
+    function: [marketing, sales, content, growth, revenue, demand, brand, gtm, go-to-market, commercial, communications]
+    seniority_alone: [cmo, cro, cco, cgo, cco & partner]
+    exclude: [intern, assistant, associate, coordinator, analyst]
+  relevant_titles: [marketing, growth, content, sales, revenue operations, revops, demand, brand, recruiter, talent]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import timedelta
 
 from .models import timestamp, utcnow
@@ -115,11 +116,30 @@ def active_finding(report, feature, policy, now):
     return finding.value if valid else unknown
 
 
+def _has_word(title, terms):
+    return any(re.search(rf"(?<![a-z]){re.escape(t.casefold())}(?![a-z])", title) for t in terms)
+
+
+def matches_rule(title, rule):
+    """Seniority x function title rule, e.g. 'SVP Global Sales' or 'Head of B2B Marketing'."""
+    if not rule:
+        return False
+    if _has_word(title, rule.get("exclude", [])):
+        return False
+    if _has_word(title, rule.get("seniority_alone", [])):
+        return True
+    return _has_word(title, rule.get("seniority", [])) and _has_word(
+        title, rule.get("function", [])
+    )
+
+
 def lead_fit(row, policy):
     title = row.get("job_title", "").casefold()
     # Only a provisional contact-role heuristic; never used to infer company hiring.
     group = "other"
-    if any(term.casefold() in title for term in policy["decision_maker_titles"]):
+    if any(term.casefold() in title for term in policy["decision_maker_titles"]) or matches_rule(
+        title, policy.get("decision_maker_rule")
+    ):
         group = "decision_maker"
     elif any(term.casefold() in title for term in policy["relevant_titles"]):
         group = "relevant"

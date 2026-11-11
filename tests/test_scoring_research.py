@@ -606,3 +606,28 @@ def test_research_validation_cli_prints_reason_not_private_values(
 def test_resume_rejects_path_traversal():
     result = CliRunner().invoke(app, ["research", "resume", "../../secret"])
     assert result.exit_code == 1 and "32-character run ID" in result.output
+
+
+def test_icp_title_rule_covers_gtm_leaders():
+    from pathlib import Path
+
+    import yaml
+
+    from gtm.scoring import lead_fit
+
+    root = Path(__file__).resolve().parents[1]
+    policy = yaml.safe_load((root / "config" / "gtm.yaml").read_text())["scoring"]
+    weights = policy["weights"]["lead_fit"]
+    for title in [
+        "Co-founder & CEO",
+        "Chief Revenue Officer",
+        "CMO",
+        "SVP Global Sales",
+        "VP of Product Marketing",
+        "Head of B2B Marketing",
+        "Head of Content",
+        "VP, Demand Generation",
+    ]:
+        assert lead_fit({"job_title": title}, policy) == weights["decision_maker"], title
+    for title in ["Head of Security", "VP Engineering", "Account Executive", "Marketing Analyst"]:
+        assert lead_fit({"job_title": title}, policy) != weights["decision_maker"], title
