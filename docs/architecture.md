@@ -7,6 +7,24 @@ enrichment vendors, sending tools, and CRM.
 
 **Status legend:** ✅ built and tested · 🟡 in progress · ⬜ planned
 
+## End goal
+
+Every person the lead-gen engine finds is tracked from first sighting to outcome, with
+nothing "on air":
+
+1. **Capture** every scraped person and their signal.
+2. **Research** the person and their company, with cited sources.
+3. **Store** everything in one hosted warehouse (Postgres).
+4. **Enrich** through AI and tools connected to that warehouse.
+5. **Run outbound** whose message is based on that research.
+6. **Track the pipeline** to results: positive replies, calls booked, deals, offers.
+
+Every step writes a record (who/what/when/which run/which model), every person is always
+in exactly one lifecycle state, and anyone stuck too long is surfaced daily.
+
+**Result metrics:** contactable rate, sent, reply rate, **positive reply rate**,
+**calls booked**, deals opened, won / hired, and time from signal to call.
+
 ## ICP
 
 | Segment | Who | Signals that qualify them |
@@ -64,9 +82,9 @@ flowchart LR
 | 1 Sources | Grok scheduled task drops dated CSVs into `data/incoming/grok/{founders,VPs}/`; LinkedIn CSVs into `data/incoming/linkedin/` | ✅ Grok, LinkedIn · ⬜ hiring-signal feeds |
 | 2 Ingest | Header mapping, Pydantic validation, content fingerprints so reruns never duplicate, deterministic identity match (email / LinkedIn URL), ambiguous matches held for review | ✅ |
 | 3 Enrich | Fill missing LinkedIn URL and work email through a provider waterfall (Clay → Vibe Prospecting → manual), verify email deliverability, record which provider supplied each field | ⬜ next |
-| 4 Research & Score | Optional agent researches each **account** once and returns cited evidence; fixed Python policy computes account fit, lead fit, intent, engagement → tier and next action. Missing evidence stays unscored, never guessed | ✅ policy and receipts · 🟡 automatic research of new accounts |
+| 4 Research & Score | **Account research** (once per company: hiring, funding, tools) and **person research** (recent posts, talks, role history, public priorities), both with cited sources; fixed Python policy computes account fit, lead fit, intent, engagement → tier and next action. Missing evidence stays unscored, never guessed | ✅ account receipts and policy · ⬜ person research · 🟡 automatic research of new accounts |
 | 5 Outbound | Generate a 3-touch email sequence and a LinkedIn connection note from each person's `signal` and `outreach_angle`; nothing sends without approval | ⬜ |
-| 6 Track | Replies and connection acceptance update status, engagement score, and follow-up dates; DNC and closed people get no actions | ✅ manual logging and follow-ups · ⬜ automatic reply detection |
+| 6 Track | Replies, connection acceptance, and **calls booked** (Cal.com/Calendly webhook) update status, engagement score, deals, and follow-ups; DNC and closed people get no actions | ✅ manual logging and follow-ups · ⬜ reply detection · ⬜ booking webhook |
 | 7 Report | Aggregate funnel metrics without exposing prospect data | ✅ `gtm portfolio-report` · ⬜ live dashboard |
 
 ## Components and adapters
@@ -82,11 +100,13 @@ flowchart TB
     Core --- RES[Researcher]
     Core --- SND[Sender]
     Core --- CRM[CRM sync]
+    Core --- BK[Booking]
     SRC --- s1[Grok CSV ✅] & s2[LinkedIn CSV ✅] & s3[Job boards ⬜]
     ENR --- e1[Clay ⬜] & e2[Vibe Prospecting ⬜]
     RES --- r1[Codex/LLM agent ✅]
     SND --- d1[Gmail drafts ⬜] & d2[Instantly / Smartlead ⬜]
     CRM --- c1[CSV master ✅] & c2[HubSpot / Attio ⬜]
+    BK --- b1[Cal.com / Calendly ⬜]
 ```
 
 | Interface | Contract |
@@ -96,6 +116,7 @@ flowchart TB
 | `Researcher` | Given a company domain, returns a structured, cited receipt validated against a JSON schema |
 | `Sender` | Creates drafts or enqueues approved messages; returns external message IDs for reply matching |
 | `CRM` | Exports the person row and activity history; the engine stays the system of record for scoring |
+| `Booking` | Receives Cal.com/Calendly webhooks, matches the invitee to a person, writes `meeting_booked` / `meeting_held` events |
 
 ## Data storage and CRM model
 
@@ -120,14 +141,18 @@ Sends and replies are not rows, so "which signal gets replies?" cannot be answer
 ```mermaid
 flowchart LR
     RAW[Raw zone<br/>data/raw/YYYY-MM-DD/<br/>every input file, immutable] --> CORE
-    CORE[(Core CRM database<br/>SQLite now · Postgres for teams)] --> VIEW[Editable views<br/>prospects.csv · companies.csv · deals.csv]
+    CORE[(CRM warehouse<br/>hosted Postgres · Supabase/Neon)] --> VIEW[Editable views<br/>prospects.csv · companies.csv · deals.csv]
     VIEW -->|manual edits sync back| CORE
     CORE --> INS[Insights<br/>SQL views · dashboard]
     INS -->|weekly| FB[Feedback: Grok brief + score weights]
 ```
 
-The database is the system of record. CSVs are generated views; edits made in them are
-validated and written back. Every write is still backed up and atomic.
+**Hosted Postgres (Supabase or Neon) is the system of record** — chosen over local SQLite
+because webhooks (Clay, Cal.com), cloud scheduled jobs, and AI tools must all reach it.
+Schema changes go through versioned migrations; `DATABASE_URL` lives only in `.env` /
+GitHub Actions secrets. Raw files are mirrored to object storage (Supabase Storage).
+CSVs are generated views; edits made in them are validated and written back in a
+transaction. Daily backups (provider point-in-time recovery plus a nightly dump).
 
 ### CRM tables and columns
 
@@ -215,10 +240,60 @@ validated and written back. Every write is still backed up and atomic.
 **score_snapshots**: `person_id`, `snapshot_date`, component scores, `tier`,
 `model_version` — lets us check whether Tier 1 actually converts.
 
+**person_research**: `research_id`, `person_id`, `researched_at`, `recent_posts`
+(summaries + URLs), `talks_podcasts`, `role_history`, `stated_priorities`,
+`personalization_hooks`, `sources` (URLs), `confidence`, `ai_output_id`. Outreach angles
+must cite at least one source from here or from account research.
+
+**account_research**: today's JSON receipts moved into a table — `company_id`,
+`researched_at`, findings with sources, `status`, `profile_hash`, `ai_output_id`.
+
+**state_transitions**: `person_id`, `from_state`, `to_state`, `at`, `run_id`, `actor`
+(system / human), `reason`. Full history of every person's journey.
+
+**pipeline_runs**: `run_id`, `job` (import / enrich / research / draft / reply_sync /
+booking), `started_at`, `finished_at`, `status`, `rows_in`, `rows_ok`, `rows_failed`,
+`error_summary`.
+
+**ai_outputs**: `ai_output_id`, `task` (research / angle / draft / classify_reply),
+`entity_type`, `entity_id`, `model`, `prompt_version`, `input_hash`, `output`,
+`sources`, `run_id`, `created_at`. Every AI result is stored and traceable.
+
+### Person lifecycle and observability
+
+```mermaid
+stateDiagram-v2
+    [*] --> scraped
+    scraped --> researched
+    researched --> enriched
+    enriched --> ready: contactable + tier + cited angle
+    enriched --> needs_manual: no email / LinkedIn found
+    ready --> in_sequence: first touch approved and sent
+    in_sequence --> replied
+    in_sequence --> unresponsive: sequence finished
+    replied --> meeting_booked: positive
+    replied --> nurture: not now
+    replied --> closed_lost: negative / unsubscribe
+    meeting_booked --> deal_open
+    deal_open --> won
+    deal_open --> closed_lost
+    unresponsive --> nurture
+```
+
+- Each person is in exactly one state; every change writes a `state_transitions` row.
+- Every job writes a `pipeline_runs` row; every AI call writes an `ai_outputs` row.
+- **Daily "stuck" report:** people over the time limit in a state (e.g. `scraped` > 2
+  days, `ready` > 3 days, `replied` without follow-up > 1 day), failed runs, and
+  enrichment gaps. Nothing silently drops out.
+- **Lineage:** any message can be traced to its signal, research sources, AI output,
+  prompt version, and approval.
+
 ### Reading past data
 
-- `gtm sql "<query>"` or `sqlite3` for ad-hoc questions.
-- Datasette to browse and filter every table in the browser.
+- `gtm sql "<query>"`, `psql`, or the Supabase SQL editor for ad-hoc questions.
+- Supabase table editor (or Metabase) to browse and filter every table.
+- A read-only Postgres MCP connection so Claude can answer questions over the
+  warehouse ("which signals got positive replies this month?").
 - Saved SQL views feeding the dashboard:
   - reply and positive-reply rate by `signal_type` and by segment
   - reply rate by signal age at send (does 3 days beat 20?)
@@ -256,6 +331,8 @@ first signal row; `source_data` history is replayed into further signal rows).
 | Import | macOS LaunchAgent every 15 min (`gtm scheduler install`) | GitHub Actions cron |
 | Enrichment + research of new accounts | manual | nightly after import |
 | Draft generation | — | nightly, into approval queue |
+| Booking webhooks | — | Cal.com/Calendly → events, instantly |
+| Stuck report | — | daily, emailed with the briefing |
 | Reply sync | — | every 30 min |
 | Daily briefing | `gtm daily` | pushed to email or Slack |
 
@@ -274,15 +351,17 @@ first signal row; `source_data` history is replayed into further signal rows).
   compute the score. Profile or policy changes invalidate cached judgments.
 - **Humans own outcomes.** Replies, acceptances, and sends are observed events, never
   model output. DNC excludes a person from all actions.
+- **Nothing on air.** Every job, AI output, and state change is logged with a run ID.
 - **Private by default.** Prospect data, state, research, and `.env` are git-ignored; the
   portfolio report exports aggregates only.
 
 ## Roadmap
 
 1. ✅ Repo, backup rotation, file-naming contract, Grok brief, ICP rule
-2. ⬜ Enrichment waterfall (Clay, Vibe Prospecting) with provenance and email verification
-3. ⬜ Data layer: CRM database (companies, people, signals, deals, messages, events,
-   tasks, enrichment, score_snapshots), raw zone, CSV views, migration, `gtm sql`
-4. ⬜ Outbound drafts, approval queue, reply detection — writing to messages/events
-5. ⬜ Adapters, GitHub Actions scheduling, automatic research of new accounts
+2. ⬜ Warehouse: hosted Postgres with all CRM, research, lifecycle, run, and AI-output
+   tables; raw zone; CSV views; migration of existing data; `gtm sql`
+3. ⬜ Enrichment waterfall (Clay, Vibe Prospecting) and person research, writing
+   provenance and sources to the warehouse
+4. ⬜ Outbound drafts from research, approval queue, reply detection, booking webhook
+5. ⬜ Adapters, GitHub Actions scheduling, automatic research, daily stuck report
 6. ⬜ Insights views + dashboard, demo mode with synthetic data, walkthrough video
