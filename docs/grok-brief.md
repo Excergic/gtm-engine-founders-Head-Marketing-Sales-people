@@ -34,7 +34,8 @@ contract for `gtm import grok`; keep it versioned with the code.
 > **Columns, exactly in this order:**
 > `name,title,company,company_website,country,city,linkedin_url,x_handle,source_url,signal,signal_date,why_fit,outreach_angle`
 >
-> - `signal_date`: ISO date `YYYY-MM-DD`.
+> - `signal_date`: exact ISO date `YYYY-MM-DD` of the signal event (announcement,
+>   post, or job-post date). Month-only or year-only dates get flagged for review.
 > - `source_url`: the page that proves the signal.
 > - `why_fit`: one sentence on why they need technical GTM help.
 > - `outreach_angle`: one sentence, specific to the signal, no generic flattery.

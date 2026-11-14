@@ -11,6 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from .fingerprint import FINGERPRINT_VERSION, LEGACY_MAPPINGS
 from .ingestion import parse_csv
 from .models import ConnectionStatus, timestamp, utcnow
 from .store import FIELDS, truth
@@ -57,10 +58,10 @@ class GTMService:
     def content_key(self, content, source, reference):
         segment = folder_segment(reference) if str(source) == "grok" else ""
         parts = [
-            "local-csv-v1",
+            FINGERPRINT_VERSION,
             str(source),
             hashlib.sha256(content).hexdigest(),
-            self.rules["mappings"][source],
+            LEGACY_MAPPINGS[str(source)],
         ]
         if segment:
             parts.append(segment)
@@ -126,10 +127,19 @@ class GTMService:
                 do_not_contact="false",
                 needs_review="false",
             )
+            reasons = []
             if not p.email and not p.linkedin_url:
+                reasons.append("Missing email and LinkedIn URL")
+            if str(p.source) == "grok" and (missing := p.missing_signal_fields()):
+                reasons.append("Missing signal fields: " + ", ".join(missing))
+            if p.signal_date_precision in {"month", "year"}:
+                reasons.append(
+                    f"signal_date has {p.signal_date_precision} precision only; freshness unverified"
+                )
+            if reasons:
                 row.update(
                     needs_review="true",
-                    review_reason="Missing email and LinkedIn URL; captured for manual review",
+                    review_reason="; ".join(reasons) + "; captured for manual review",
                 )
             rows.append(row)
         for field in (
@@ -140,6 +150,14 @@ class GTMService:
             "domain",
             "website",
             "job_title",
+            "country",
+            "city",
+            "x_handle",
+            "source_url",
+            "signal",
+            "signal_date",
+            "why_fit",
+            "outreach_angle",
         ):
             incoming = getattr(p, field)
             if incoming and not row.get(field):

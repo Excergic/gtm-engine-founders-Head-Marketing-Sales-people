@@ -2,22 +2,43 @@
 
 Have the bot save founder CSVs into `data/incoming/grok/founders/` and VP CSVs into `data/incoming/grok/VPs/`. Both directories are created on a real import. With a custom `GROK_CSV_DIRECTORY`, use the same `founders/` and `VPs/` subfolders there. No API call and no change to your existing Grok columns is needed. Publish completed files using `.tmp` → `.csv` rename in the same directory. The job additionally checks size, mtime, inode and ctime stability over `GROK_FILE_STABILITY_SECONDS`, then verifies the captured snapshot. A stability check cannot prove a paused writer is finished; atomic rename is preferred.
 
-Only a full name is required. Recognized headers are case-insensitive and reordered/missing optional columns are accepted:
+## The Grok contract
 
-| Master field | Accepted input headers |
-|---|---|
-| full_name | full_name, name, contact name |
-| company_name | company_name, company, account |
-| website → derived domain | website, company website, company_website |
-| domain | domain, company domain |
-| email | email, work email |
-| linkedin_url | linkedin_url, linkedin, linkedin profile url |
-| job_title | job_title, title, job title |
-| discovered_at | discovered_at, discovery date |
-| objective | objective, campaign |
-| notes | notes |
+Every Grok CSV has these 13 columns (see [grok-brief.md](grok-brief.md)). Each row is
+validated by the Pydantic `Prospect` model in `src/gtm/models.py`; the header mapping
+lives in `config/gtm.yaml` and is checked against that model when config loads.
 
-All canonical fields also work by their own names; aliases are configurable in `config/gtm.yaml`. No `domain_verified` or `email_verified` field is required. Missing email/website is acceptable. Missing both email and LinkedIn URL captures a review flag; a possible same-name/company match is held rather than automatically merged. Unknown columns such as `signal`, `source_url`, `why_fit`, `country`, and `outreach_angle` are retained visibly and in source history. Arbitrary campaign text must be mapped separately rather than passed as an objective: objectives are `consulting_client` or `remote_job`.
+| Grok column | Master field | Validation |
+|---|---|---|
+| `name` | `full_name` | required, 2–200 chars |
+| `title` | `job_title` | ≤200 chars; drives the ICP title rule |
+| `company` | `company_name` | ≤200 chars |
+| `company_website` | `website` → `domain` | valid http(s) URL / domain |
+| `country`, `city` | same | ≤100 chars |
+| `linkedin_url` | same | must be a personal `/in/` profile; normalized |
+| `x_handle` | same | `@name`, `name`, or x.com/twitter.com URL → `@name` |
+| `source_url` | same | http(s) URL |
+| `signal` | same | ≤1000 chars |
+| `signal_date` | same | `YYYY-MM-DD`; `YYYY-MM` / `YYYY` kept as given; never in the future |
+| `why_fit`, `outreach_angle` | same | ≤1000 chars |
+
+Outcomes per row:
+
+- **Invalid value** (bad URL, future or malformed date, company page instead of a
+  profile): the row is rejected and reported in the import summary; nothing is written.
+- **Missing `signal`, `signal_date`, or `source_url`**, or a `signal_date` with only
+  month/year precision: the person is captured and flagged `needs_review`, with the
+  reason in `review_reason`. Nothing is silently dropped and no date is invented.
+- **Missing both email and LinkedIn URL**: captured and flagged for review.
+- A possible same-name/company match is held for review rather than merged.
+
+Columns outside the contract are still kept as extra master columns and in source
+history. Imported values fill blanks only; your manual edits always win.
+
+Import fingerprints use a frozen mapping (`src/gtm/fingerprint.py`), so editing
+`config/gtm.yaml` never makes already-imported files look new.
+
+Arbitrary campaign text must be mapped separately rather than passed as an objective: objectives are `consulting_client` or `remote_job`.
 
 ```sh
 uv run gtm import grok path/to/daily.csv --dry-run
@@ -30,7 +51,7 @@ uv run gtm import retry-failed
 
 Dry-run now checks the local master and predicts creates/updates; there is no separate CRM preview. It writes no prospect/state/snapshot data. Exit 0 means complete, exit 2 means review/invalid/failed rows, and exit 1 means a command/configuration/local filesystem failure. A newly captured weak identity appears in `gtm import review` even though its row imported successfully.
 
-Each original CSV stays untouched. SHA-256 content, source, mapping and backend namespace determine file identity, so renaming a completed CSV does not import again. New files can update existing people. Successful row checkpoints skip on rerun; crash recovery reconciles row observation keys in the master. Keep source history columns intact. Raw imports do not create opportunity stages unless requested by explicit `create_opportunity`/`opportunity_stage` fields; normally set stages in the master after reviewing leads.
+Each original CSV stays untouched. SHA-256 content, source, frozen fingerprint version and folder segment determine file identity, so renaming a completed CSV does not import again. New files can update existing people. Successful row checkpoints skip on rerun; crash recovery reconciles row observation keys in the master. Keep source history columns intact. Raw imports do not create opportunity stages unless requested by explicit `create_opportunity`/`opportunity_stage` fields; normally set stages in the master after reviewing leads.
 
 Optional macOS scheduling:
 

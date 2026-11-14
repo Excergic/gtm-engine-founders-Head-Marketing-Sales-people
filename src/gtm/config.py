@@ -54,6 +54,13 @@ class Settings(BaseModel):
                 for names in mapping.values()
             ):
                 raise ValueError(f"mappings.{source} must map fields to column aliases")
+            from .models import Prospect
+
+            unknown = sorted(set(mapping) - set(Prospect.model_fields))
+            if unknown:
+                raise ValueError(
+                    f"mappings.{source} has fields not in the Prospect model: {', '.join(unknown)}"
+                )
         for field in ("pending_days", "proposal_days", "outreach_days"):
             value = rules.get("followups", {}).get(field)
             if type(value) is not int or value < 0:

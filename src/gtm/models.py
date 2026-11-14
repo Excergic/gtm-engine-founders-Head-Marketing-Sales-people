@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from email.headerregistry import Address
 from enum import StrEnum
 from urllib.parse import unquote, urlsplit
@@ -55,6 +55,33 @@ def normalize_linkedin(value: str) -> str:
     return "https://www.linkedin.com" + path
 
 
+def normalize_http_url(value: str) -> str:
+    url = urlsplit(value if "://" in value else "https://" + value)
+    if url.scheme not in {"http", "https"} or "." not in (url.hostname or ""):
+        raise ValueError("expected an http(s) URL with a domain")
+    return url.geturl()
+
+
+def normalize_x_handle(value: str) -> str:
+    """Accept '@name', 'name', or an x.com / twitter.com profile URL; return '@name'."""
+    text = value.strip()
+    if "/" in text or "." in text:
+        url = urlsplit(text if "://" in text else "https://" + text)
+        host = (url.hostname or "").lower().removeprefix("www.")
+        if host not in {"x.com", "twitter.com"}:
+            raise ValueError("x_handle must be a handle or an x.com profile URL")
+        text = url.path.strip("/").split("/")[0]
+    handle = text.removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+        raise ValueError("invalid X handle")
+    return "@" + handle
+
+
+# Grok columns that signal-based outbound depends on. Rows missing any are still
+# captured, but flagged for review rather than silently accepted.
+SIGNAL_FIELDS = ("signal", "signal_date", "source_url")
+
+
 class Source(StrEnum):
     linkedin = "linkedin"
     grok = "grok"
@@ -78,23 +105,31 @@ class ConnectionStatus(StrEnum):
 
 
 class Prospect(BaseModel):
+    """Canonical person contract shared by every source (Grok, LinkedIn, manual)."""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    full_name: str = Field(min_length=2)
+    # Identity
+    full_name: str = Field(min_length=2, max_length=200)
     source: Source
     objective: Objective = Objective.consulting_client
     email: str | None = None
-    email_verified: bool = False
     linkedin_url: str | None = None
-    company_name: str | None = None
+    x_handle: str | None = None
+    job_title: str | None = Field(default=None, max_length=200)
+    country: str | None = Field(default=None, max_length=100)
+    city: str | None = Field(default=None, max_length=100)
+    # Company
+    company_name: str | None = Field(default=None, max_length=200)
     domain: str | None = None
-    domain_verified: bool = False
     website: str | None = None
-    job_title: str | None = None
-    industry: str | None = None
-    company_size: int | None = Field(default=None, ge=1)
-    icp_segment: str = "unclassified"
+    # Signal (why this person, why now)
+    signal: str | None = Field(default=None, max_length=1000)
+    signal_date: str | None = None  # YYYY-MM-DD, or YYYY-MM / YYYY when Grok is imprecise
+    source_url: str | None = None
+    why_fit: str | None = Field(default=None, max_length=1000)
+    outreach_angle: str | None = Field(default=None, max_length=1000)
+    # Provenance and lifecycle
     discovered_at: datetime = Field(default_factory=utcnow)
-    external_id: str | None = None
     source_reference: str = "manual"
     connection_status: ConnectionStatus = ConnectionStatus.discovered
     status_observed_at: datetime | None = None
@@ -103,10 +138,6 @@ class Prospect(BaseModel):
     next_followup_at: datetime | None = None
     notes: str | None = None
     do_not_contact: bool = False
-    signal_level: str = "none"
-    signal_at: datetime | None = None
-    signal_provenance: str | None = None
-    signal_objective: Objective | None = None
     create_opportunity: bool = False
     opportunity_stage: str | None = None
 
@@ -162,26 +193,53 @@ class Prospect(BaseModel):
         "status_observed_at",
         "last_contact_at",
         "next_followup_at",
-        "signal_at",
         mode="before",
     )
     @classmethod
     def dates(cls, value):
         return timestamp(value) if value else None
 
-    @field_validator("signal_level")
+    @field_validator("source_url")
     @classmethod
-    def signal(cls, value):
-        if value not in {"strong", "moderate", "none"}:
-            raise ValueError("signal_level must be strong, moderate, or none")
-        return value
+    def source_link(cls, value):
+        return normalize_http_url(value) if value else None
+
+    @field_validator("x_handle")
+    @classmethod
+    def x_profile(cls, value):
+        return normalize_x_handle(value) if value else None
+
+    @field_validator("signal_date", mode="before")
+    @classmethod
+    def signal_day(cls, value):
+        """Keep the precision the source gave; never invent a day or month."""
+        if isinstance(value, datetime | date):
+            value = value.isoformat()
+        text = str(value).strip()
+        if "T" in text:
+            text = timestamp(text).date().isoformat()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            date.fromisoformat(text)
+        elif re.fullmatch(r"\d{4}-\d{2}", text):
+            date.fromisoformat(text + "-01")
+        elif not re.fullmatch(r"\d{4}", text):
+            raise ValueError("signal_date must be YYYY-MM-DD (or YYYY-MM / YYYY)")
+        today = (utcnow() + timedelta(days=1)).date().isoformat()
+        if text > today[: len(text)]:
+            raise ValueError("signal_date is in the future")
+        return text
+
+    @property
+    def signal_date_precision(self) -> str | None:
+        if not self.signal_date:
+            return None
+        return {10: "day", 7: "month", 4: "year"}[len(self.signal_date)]
+
+    def missing_signal_fields(self) -> list[str]:
+        return [name for name in SIGNAL_FIELDS if not getattr(self, name)]
 
     @model_validator(mode="after")
     def derive_domain(self):
         if not self.domain and self.website:
             self.domain = normalize_domain(self.website)
-        if self.email_verified and not self.email:
-            raise ValueError("email_verified requires email")
-        if self.signal_level != "none" and (not self.signal_at or not self.signal_provenance):
-            raise ValueError("signals require timestamp and provenance")
         return self
