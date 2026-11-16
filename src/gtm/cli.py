@@ -652,3 +652,66 @@ def db_load_existing():
             "row_counts": {k: {"before": before[k], "after": after[k]} for k in after},
         }
     )
+
+
+@db_app.command("import")
+@guarded
+def db_import():
+    """Load new inbox CSVs into raw and import their people; every row gets an outcome."""
+    from .warehouse_import import WarehouseImporter
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        output(WarehouseImporter(conn, settings.data_directory, settings.rules()).run())
+
+
+@db_app.command("review")
+@guarded
+def db_review():
+    """List rows held because they look like an existing person (same name and company)."""
+    from .warehouse_import import review_queue
+
+    with warehouse_connection() as conn:
+        queue = review_queue(conn)
+        output({"open": len(queue), "items": queue})
+
+
+@db_app.command("resolve")
+@guarded
+def db_resolve(
+    raw_row_id: int,
+    action: Annotated[str, typer.Argument(help="merge, new or reject")],
+    by: Annotated[str, typer.Option(help="who decided")] = "human",
+):
+    """Resolve one review item: merge into the candidate, register as new, or reject."""
+    from .warehouse_import import resolve
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        output(resolve(conn, settings.data_directory, settings.rules(), raw_row_id, action, by))
+
+
+@db_app.command("export-views")
+@guarded
+def db_export_views():
+    """Write data/views/prospects.csv, companies.csv and deals.csv from the warehouse."""
+    from .warehouse_views import export_views
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        output(export_views(conn, settings.data_directory / "views"))
+
+
+@db_app.command("apply-edits")
+@guarded
+def db_apply_edits(by: Annotated[str, typer.Option(help="who made the edits")] = "human"):
+    """Validate edits made in data/views/prospects.csv and write them back in one transaction."""
+    from .warehouse_views import apply_view_edits
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        conn.autocommit = True
+        result = apply_view_edits(conn, settings.data_directory / "views", by)
+        output(result)
+        if result["errors"]:
+            raise typer.Exit(1)

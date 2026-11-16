@@ -88,10 +88,10 @@ class Loader:
 
     # -- run bookkeeping -----------------------------------------------------------
 
-    def start(self):
+    def start(self, job: str = "migration"):
         self.run_id = self.conn.execute(
-            "insert into ops.pipeline_runs (job, details) values ('migration', %s) returning run_id",
-            (Jsonb({"loader": "warehouse_load", "raw_date": self.today}),),
+            "insert into ops.pipeline_runs (job, details) values (%s, %s) returning run_id",
+            (job, Jsonb({"loader": "warehouse_load", "raw_date": self.today})),
         ).fetchone()[0]
         self.conn.commit()
 
@@ -330,6 +330,18 @@ class Loader:
             "select ops.register_prospect(%s, %s, 'system', 'migrated from prospects.csv', %s)",
             (Jsonb(prospect), self.run_id, first_raw),
         )
+
+        has_outcomes = self.conn.execute(
+            "select to_regclass('ops.raw_row_outcomes') is not null"
+        ).fetchone()[0]
+        if has_outcomes:
+            for raw_id in {r for r in raw_ids if r}:
+                self.conn.execute(
+                    "insert into ops.raw_row_outcomes (raw_row_id, outcome, prospect_id, reason,"
+                    " run_id) values (%s, 'migrated', %s, 'linked during the initial load', %s)"
+                    " on conflict (raw_row_id) do nothing",
+                    (raw_id, pid, self.run_id),
+                )
 
         # Signals: the current one, plus any different ones in the source history.
         seen = set()

@@ -154,7 +154,11 @@ def signal_for(conn, pid):
 
 def test_migrate_is_idempotent_and_creates_every_table(blank_db):
     first = warehouse.migrate(blank_db)
-    assert first == ["0001_layered_warehouse.sql", "0002_access_roles.sql"]
+    assert first == [
+        "0001_layered_warehouse.sql",
+        "0002_access_roles.sql",
+        "0003_raw_row_outcomes.sql",
+    ]
     assert warehouse.migrate(blank_db) == []
     tables = {
         f"{s}.{t}"
@@ -171,6 +175,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "staging.prospects", "silver.prospects", "golden.prospects",
         "outbound.messages", "outbound.events", "outbound.tasks", "outbound.deals",
         "ops.pipeline_runs", "ops.state_transitions", "ops.ai_outputs", "ops.schema_migrations",
+        "ops.raw_row_outcomes",
     }  # fmt: skip
     assert all(row["state"] == "applied" for row in warehouse.status(blank_db))
 
@@ -469,3 +474,164 @@ def test_load_existing_places_people_and_keeps_raw_files(db, system):
     rerun = load_existing(db, settings.data_directory, settings.tracker, settings.rules())
     assert rerun["counts"]["people_already_present"] == 2
     assert layer_counts(db) == counts
+
+
+# --- importing into the warehouse ---------------------------------------------------------
+
+
+def _import(db, settings):
+    from gtm.warehouse_import import WarehouseImporter
+
+    return WarehouseImporter(db, settings.data_directory, settings.rules()).run()
+
+
+def test_import_records_one_outcome_per_row_and_follows_identity_rules(db, system):
+    from test_grok_contract import grok_row, write
+
+    from gtm.warehouse_import import resolve, review_queue
+
+    _, settings = system
+    db.commit()
+    sam = grok_row(name="Sam Nolink", linkedin_url="", company_website="https://b.example")
+    write(settings.grok_directory / "VPs" / "2026-11-12_vps.csv", [grok_row(), sam])
+    first = _import(db, settings)
+    assert first["outcomes"] == {"registered": 2}
+
+    write(
+        settings.grok_directory / "founders" / "2026-11-13_founders.csv",
+        [
+            # Same LinkedIn URL, newer signal: merged, signal appended, founders segment added.
+            grok_row(signal="Hired a VP of Sales", signal_date="2026-11-10", city=""),
+            sam,  # identical row again: duplicate
+            {**sam, "signal": "Opened a RevOps role"},  # same name+company, no key: review
+            grok_row(name="New Person", linkedin_url="", company_website="https://c.example"),
+            grok_row(name="Bad Date", linkedin_url="", signal_date="soon"),
+        ],
+    )
+    second = _import(db, settings)
+    assert second["outcomes"] == {
+        "merged": 1, "duplicate": 1, "held_for_review": 1, "registered": 1, "invalid": 1,
+    }  # fmt: skip
+    assert second["problems"] == []
+
+    riley = db.execute(
+        "select segment, signal, signal_date, city from silver.prospects where name = %s",
+        ("Riley Synthetic",),
+    ).fetchone()
+    assert riley == (["VPs", "founders"], "Hired a VP of Sales", "2026-11-10", "Austin")
+    assert db.execute(
+        "select count(*) from core.signals s join silver.prospects p using (prospect_id)"
+        " where p.name = 'Riley Synthetic'"
+    ).fetchone() == (2,)
+
+    # Every raw row has exactly one outcome; a rerun changes nothing.
+    assert db.execute(
+        "select count(*) from raw.grok_rows g left join ops.raw_row_outcomes o using (raw_row_id)"
+        " where o.raw_row_id is null"
+    ).fetchone() == (0,)
+    assert _import(db, settings)["outcomes"] == {}
+
+    queue = review_queue(db)
+    assert len(queue) == 1 and queue[0]["candidate"]["name"] == "Sam Nolink"
+    result = resolve(
+        db, settings.data_directory, settings.rules(), queue[0]["raw_row_id"], "merge", "tester"
+    )
+    assert result["resolution"] == "merge"
+    assert review_queue(db) == []
+    assert db.execute(
+        "select signal from staging.prospects where name = 'Sam Nolink'"
+    ).fetchone() == ("Raised Series A; hiring first GTM engineer",)  # older signal stays current
+    assert db.execute(
+        "select count(*) from core.signals s join staging.prospects p using (prospect_id)"
+        " where p.name = 'Sam Nolink'"
+    ).fetchone() == (2,)
+
+
+def test_import_after_initial_load_does_not_reimport_loaded_rows(db, system):
+    from test_grok_contract import grok_row, write
+
+    from gtm.warehouse_load import load_existing
+
+    service, settings = system
+    db.commit()
+    path = write(settings.grok_directory / "VPs" / "2026-11-01_vps.csv", [grok_row()])
+    service.import_file(path, "grok")
+    load_existing(db, settings.data_directory, settings.tracker, settings.rules())
+    assert _import(db, settings)["outcomes"] == {}
+    assert db.execute("select outcome from ops.raw_row_outcomes").fetchall() == [("migrated",)]
+
+
+# --- CSV views -----------------------------------------------------------------------------
+
+
+def _view(settings):
+    return settings.data_directory / "views" / "prospects.csv"
+
+
+def _rewrite(path, edit):
+    import csv as _csv
+
+    with path.open(newline="") as file:
+        reader = _csv.DictReader(file)
+        columns, rows = reader.fieldnames, list(reader)
+    for row in rows:
+        edit(row)
+    with path.open("w", newline="") as file:
+        writer = _csv.DictWriter(file, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_view_edits_are_validated_and_applied_in_one_transaction(db, system):
+    from gtm.warehouse_views import apply_view_edits, export_views
+
+    _, settings = system
+    pid = register(db, linkedin_url=linkedin("ada"))
+    register(db, name="Bo Other", company="Other Co")
+    db.autocommit = True
+    views = settings.data_directory / "views"
+    assert export_views(db, views)["prospects.csv"] == 2
+
+    def add_email(row):
+        if row["prospect_id"] == str(pid):
+            row["email"] = "Ada@Example.com"
+            row["email_status"] = "verified"
+            row["notes"] = "met at conference"
+
+    _rewrite(_view(settings), add_email)
+    result = apply_view_edits(db, views)
+    assert result["errors"] == [] and result["layers"] == {str(pid): "golden"}
+    assert db.execute(
+        "select email, notes from golden.prospects where prospect_id = %s", (pid,)
+    ).fetchone() == ("ada@example.com", "met at conference")
+
+    # Read-only column edits and stale rows are refused, and nothing is written.
+    export_views(db, views)
+    _rewrite(_view(settings), lambda row: row.update(tier="tier_1", notes="x"))
+    refused = apply_view_edits(db, views)
+    assert refused["applied"] == 0 and any("tier is read-only" in e for e in refused["errors"])
+    assert db.execute("select count(*) from core.all_prospects where notes = 'x'").fetchone() == (
+        0,
+    )
+
+    export_views(db, views)
+    db.execute("select ops.update_prospect(%s, %s, null, 'system', 't')",
+               (pid, Jsonb({"owner": "someone"})))  # fmt: skip
+    _rewrite(_view(settings), lambda row: row.update(notes="stale edit"))
+    stale = apply_view_edits(db, views)
+    assert any("changed in the warehouse after export" in e for e in stale["errors"])
+
+    # A database rule failure rolls back every row in the batch.
+    export_views(db, views)
+
+    def break_one(row):
+        row["notes"] = "batch"
+        if row["name"] == "Bo Other":
+            row["email_status"] = "verified"  # verified without an email: refused
+
+    _rewrite(_view(settings), break_one)
+    with pytest.raises(psycopg.Error):
+        apply_view_edits(db, views)
+    assert db.execute(
+        "select count(*) from core.all_prospects where notes = 'batch'"
+    ).fetchone() == (0,)

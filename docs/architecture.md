@@ -170,7 +170,7 @@ for reporting only.
 | `silver` | `prospects` | Verified email **or** LinkedIn URL, not both |
 | `golden` | `prospects` | Verified email **and** LinkedIn URL. **Outbound reads only this.** |
 | `outbound` | `messages`, `events`, `tasks`, `deals` | Every row points to a golden prospect |
-| `ops` | `pipeline_runs`, `state_transitions`, `ai_outputs`, `schema_migrations` | Observability across all layers |
+| `ops` | `pipeline_runs`, `state_transitions`, `ai_outputs`, `raw_row_outcomes`, `schema_migrations` | Observability across all layers |
 
 #### Grok column contract is kept in every layer
 
@@ -346,6 +346,11 @@ must cite at least one source from here or from account research.
 `to_state`, `at`, `run_id`, `actor` (system / human), `reason`. Full history of every
 person's journey through layers and lifecycle stages.
 
+**ops.raw_row_outcomes**: one row per raw Grok row: `outcome` (registered / merged /
+duplicate / held_for_review / invalid / migrated), `prospect_id`, `candidate_prospect_id`,
+`reason`, `run_id`, and for held rows the human `resolution` (merged / new / rejected).
+Open held rows are the review queue (`gtm db review`, `gtm db resolve`).
+
 **ops.pipeline_runs**: `run_id`, `job` (import / enrich / promote / research / draft /
 reply_sync / booking), `started_at`, `finished_at`, `status`, `rows_in`, `rows_ok`,
 `rows_failed`, `error_summary`.
@@ -388,6 +393,21 @@ stateDiagram-v2
   enrichment gaps. Nothing silently drops out.
 - **Lineage:** any message can be traced to its signal, research sources, AI output,
   prompt version, and approval.
+
+### Commands
+
+| Command | Does |
+|---|---|
+| `gtm db migrate` / `gtm db status` | Apply / list numbered migrations |
+| `gtm db import` | New inbox CSVs → `data/raw/YYYY-MM-DD/` and `raw` → people, one outcome per row |
+| `gtm db review` / `gtm db resolve <raw_row_id> merge\|new\|reject` | Work the review queue |
+| `gtm db export-views` | Write `data/views/prospects.csv`, `companies.csv`, `deals.csv` |
+| `gtm db apply-edits` | Validate edits in `data/views/prospects.csv`; write back in one transaction |
+| `gtm db load-existing` | One-time load of the old master CSV and inbox files |
+| `gtm sql "<query>"` | Read-only query |
+
+In the view, signal columns are read-only (signals are append-only history) and a row
+changed in the warehouse after export is refused, so edits never overwrite newer data.
 
 ### Reading past data
 
