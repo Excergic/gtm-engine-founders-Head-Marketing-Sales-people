@@ -164,13 +164,13 @@ for reporting only.
 
 | Schema | Holds | Rule |
 |---|---|---|
-| `raw` | `files`, `grok_rows`, `provider_responses` | Append-only. Nothing is edited or deleted. Rows that fail validation still land here, with the errors. |
+| `raw` | `files`, `grok_rows`, `linkedin_rows`, `provider_responses` | Append-only. Nothing is edited or deleted. Rows that fail validation still land here, with the errors. |
 | `core` | `prospect_registry`, `companies`, `signals`, `enrichment`, `person_research`, `account_research`, `score_snapshots` | Data about a person or account at any layer |
 | `staging` | `prospects` | Clean, deduplicated, no email and no LinkedIn URL yet |
 | `silver` | `prospects` | Verified email **or** LinkedIn URL, not both |
 | `golden` | `prospects` | Verified email **and** LinkedIn URL. **Outbound reads only this.** |
 | `outbound` | `messages`, `events`, `tasks`, `deals` | Every row points to a golden prospect |
-| `ops` | `pipeline_runs`, `state_transitions`, `ai_outputs` | Observability across all layers |
+| `ops` | `pipeline_runs`, `state_transitions`, `ai_outputs`, `schema_migrations` | Observability across all layers |
 
 #### Grok column contract is kept in every layer
 
@@ -197,8 +197,16 @@ The Grok bot writes 13 columns:
 - Each person has **one `prospect_id` for life**, registered in `core.prospect_registry`
   with their current `layer`. They live in exactly one of `staging`, `silver` or `golden`
   at a time.
-- Promotion moves the row, updates `layer` and writes a `state_transitions` row in one
-  transaction. Enrichment only searches for what is missing (silver needs one field).
+- People move only through three database functions, each one transaction that also
+  writes `state_transitions`:
+  - `ops.register_prospect(row, run, actor, reason)` places a new person in the layer
+    their data already qualifies for (a Grok row with a LinkedIn URL starts in silver).
+  - `ops.update_prospect(id, changes, run, actor, reason)` applies changes (for example,
+    an email enrichment found) and moves the person up when they now qualify. It never
+    moves anyone down and refuses unknown columns.
+  - `ops.transition(id, to_state, run, actor, reason)` is the only way to change
+  `lifecycle_stage`; a direct update is refused by trigger.
+- Enrichment only searches for what is missing (silver needs one field).
 - Check constraints enforce each layer's requirements in the database, not only in code.
 - A golden prospect with outbound history is never moved out. A later bounce sets
   `email_status = bounced`, which blocks email sends; LinkedIn stays allowed.
@@ -228,6 +236,11 @@ core.prospect_registry (prospect_id)
 - `lifecycle_stage` changes only through transition code that writes `state_transitions`.
   `updated_at` is set by trigger.
 - `pipeline_runs` describes a whole job, so it has no prospect key.
+- Access roles: `gtm_pipeline` (import, enrich, promote), `gtm_outbound` (can use only
+  `golden`, `outbound` and the research it needs; has no access to `raw`, `staging` or
+  `silver`), `gtm_reader` (read-only reporting and the Claude connection).
+- Migrations are numbered SQL files in `src/gtm/migrations/`, applied by
+  `gtm db migrate`, each in one transaction, checksummed in `ops.schema_migrations`.
 
 ### CRM tables and columns
 
@@ -241,7 +254,7 @@ core.prospect_registry (prospect_id)
 | `email`, `email_status` (verified / risky / invalid / bounced / unknown), `email_source`, `domain` | |
 | `seniority` (founder / c_suite / vp / head), `function` (founder / marketing / content / sales / revenue) | derived from title rule |
 | `timezone` | |
-| `lifecycle_stage` | new → contactable → contacted → engaged → meeting → opportunity → won / lost / nurture |
+| `lifecycle_stage` | states in the lifecycle diagram below (scraped → … → won / closed_lost / nurture) |
 | `lead_status` (open / in_sequence / replied / unresponsive / bad_fit) | |
 | `connection_status` (none / requested / connected) | LinkedIn |
 | `reply_status` (none / positive / neutral / negative / ooo) | latest reply |

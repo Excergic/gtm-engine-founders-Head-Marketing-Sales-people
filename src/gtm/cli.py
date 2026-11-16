@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
+import psycopg
 import typer
 from pydantic import ValidationError
 
@@ -49,6 +50,8 @@ scheduler_app = typer.Typer(help="Optional macOS local CSV import every 15 minut
 app.add_typer(scheduler_app, name="scheduler")
 research_app = typer.Typer(help="Evidence-backed account research; no automatic outreach.")
 app.add_typer(research_app, name="research")
+db_app = typer.Typer(help="Postgres warehouse (DATABASE_URL in .env): migrations and status.")
+app.add_typer(db_app, name="db")
 
 
 def output(value):
@@ -76,7 +79,7 @@ def guarded(fn):
             fields = [".".join(map(str, e["loc"])) for e in exc.errors(include_input=False)]
             typer.echo("Error: invalid values in fields: " + ", ".join(fields), err=True)
             raise typer.Exit(1) from exc
-        except (ValueError, RuntimeError, OSError, csv.Error, sqlite3.Error) as exc:
+        except (ValueError, RuntimeError, OSError, csv.Error, sqlite3.Error, psycopg.Error) as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(1) from exc
 
@@ -581,3 +584,51 @@ def portfolio_report(output_path: Path | None = None):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
     app()
+
+
+def warehouse_connection():
+    from dotenv import load_dotenv
+
+    from . import warehouse
+
+    load_dotenv(Path.cwd() / ".env", interpolate=False)
+    try:
+        return warehouse.connect()
+    except Exception as exc:  # psycopg errors can include the host; keep the message short
+        raise RuntimeError(f"cannot connect to the warehouse: {type(exc).__name__}") from exc
+
+
+@db_app.command("status")
+@guarded
+def db_status():
+    """Show which migrations are applied, pending, or changed since applying."""
+    from . import warehouse
+
+    with warehouse_connection() as conn:
+        output(warehouse.status(conn))
+
+
+@db_app.command("migrate")
+@guarded
+def db_migrate():
+    """Apply pending migrations in order, each in its own transaction."""
+    from . import warehouse
+
+    with warehouse_connection() as conn:
+        output({"applied": warehouse.migrate(conn)})
+
+
+@app.command("sql")
+@guarded
+def sql_command(query: str, limit: Annotated[int, typer.Option(min=1)] = 200):
+    """Run one read-only SQL query against the warehouse and print the rows as JSON."""
+    with warehouse_connection() as conn:
+        conn.read_only = True
+        with conn.cursor() as cur:
+            cur.execute(query)
+            if cur.description is None:
+                output({"rows": [], "row_count": cur.rowcount})
+                return
+            columns = [c.name for c in cur.description]
+            rows = [dict(zip(columns, r, strict=True)) for r in cur.fetchmany(limit)]
+            output({"rows": rows, "truncated": cur.fetchone() is not None})
