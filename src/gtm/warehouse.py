@@ -73,6 +73,7 @@ def applied(conn: psycopg.Connection) -> dict[str, tuple[str, str]]:
     conn.execute(_BOOTSTRAP)
     conn.commit()
     rows = conn.execute("select version, name, checksum from ops.schema_migrations").fetchall()
+    conn.commit()  # leave no transaction open, so each migration below is its own commit
     return {version: (name, checksum) for version, name, checksum in rows}
 
 
@@ -88,7 +89,9 @@ def status(conn: psycopg.Connection, directory: Path = MIGRATIONS_DIR) -> list[d
 
 
 def migrate(conn: psycopg.Connection, directory: Path = MIGRATIONS_DIR) -> list[str]:
-    """Apply pending migrations in order. Returns the names applied."""
+    """Apply pending migrations in order, each committed on its own. Returns names applied."""
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise WarehouseError("commit or roll back the open transaction before migrating")
     done = applied(conn)
     ran = []
     for m in load_migrations(directory):

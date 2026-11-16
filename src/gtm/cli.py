@@ -632,3 +632,23 @@ def sql_command(query: str, limit: Annotated[int, typer.Option(min=1)] = 200):
             columns = [c.name for c in cur.description]
             rows = [dict(zip(columns, r, strict=True)) for r in cur.fetchmany(limit)]
             output({"rows": rows, "truncated": cur.fetchone() is not None})
+
+
+@db_app.command("load-existing")
+@guarded
+def db_load_existing():
+    """Load inbox CSVs into raw and prospects.csv people into the layers; show row counts."""
+    from .warehouse_load import layer_counts, load_existing
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        before = layer_counts(conn)
+        conn.commit()
+        result = load_existing(conn, settings.data_directory, settings.tracker, settings.rules())
+        after = layer_counts(conn)
+    output(
+        {
+            **result,
+            "row_counts": {k: {"before": before[k], "after": after[k]} for k in after},
+        }
+    )

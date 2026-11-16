@@ -184,6 +184,14 @@ def test_changed_migration_is_refused(blank_db, tmp_path):
         warehouse.migrate(blank_db, tmp_path)
 
 
+def test_each_migration_is_committed_by_itself(blank_db, server_url):
+    name = blank_db.info.dbname
+    warehouse.migrate(blank_db)
+    blank_db.close()  # closing without commit must not lose anything
+    with psycopg.connect(server_url.rsplit("/", 1)[0] + "/" + name) as fresh:
+        assert all(row["state"] == "applied" for row in warehouse.status(fresh))
+
+
 def test_failed_migration_rolls_back(blank_db, tmp_path):
     (tmp_path / "0001_bad.sql").write_text("create table half_done (id int); select 1/0;")
     with pytest.raises(psycopg.Error):
@@ -399,3 +407,65 @@ def test_outbound_role_cannot_read_raw_staging_or_silver(db):
 def test_unknown_columns_are_refused(db):
     rejected(db, "select ops.register_prospect(%s, null, 'system', 't')",
              (Jsonb(person(full_name="Old Name")),), match="unknown prospect columns: full_name")  # fmt: skip
+
+
+# --- loading existing local data -------------------------------------------------------
+
+
+def test_load_existing_places_people_and_keeps_raw_files(db, system):
+    from test_grok_contract import grok_row, write
+
+    from gtm.warehouse_load import layer_counts, load_existing
+
+    service, settings = system
+    db.commit()
+    path = write(
+        settings.grok_directory / "founders" / "2026-11-01_founders.csv",
+        [
+            grok_row(),
+            grok_row(name="Sam Nolink", linkedin_url="", company_website="https://b.example"),
+            grok_row(name="Bad Date", linkedin_url="", signal_date="last week"),
+        ],
+    )
+    service.import_file(path, "grok")
+    rows = service.store.load()
+    rows[0]["x_handle"] = "riley_synth"  # older master rows store handles without "@"
+    with service.state.lock():
+        service.write_rows(rows)
+    with service.state.lock():  # writes plain-text score_reasons, as the real master has
+        service.write_rows(service.store.load())
+
+    result = load_existing(db, settings.data_directory, settings.tracker, settings.rules())
+    assert result["problems"] == []
+    counts = layer_counts(db)
+    assert counts["raw.files"] == 1
+    assert (counts["raw.grok_rows valid"], counts["raw.grok_rows review"]) == (1, 1)
+    assert counts["raw.grok_rows invalid"] == 1
+    assert (counts["staging.prospects"], counts["silver.prospects"]) == (1, 1)
+    assert counts["golden.prospects"] == 0
+    assert counts["core.signals"] == 2 and counts["core.companies"] == 2
+
+    copied = settings.data_directory / "raw"
+    assert [p.read_bytes() for p in copied.rglob("*.csv")] == [path.read_bytes()]
+    assert (
+        db.execute(
+            "select count(*) from core.prospect_registry where first_raw_row_id is not null"
+        ).fetchone()[0]
+        == 2
+    )
+    silver = db.execute("select name, segment, linkedin_url from silver.prospects").fetchone()
+    assert silver == (
+        "Riley Synthetic",
+        ["founders"],
+        "https://www.linkedin.com/in/riley-synthetic",
+    )
+
+    assert db.execute("select x_handle from silver.prospects").fetchone() == ("@riley_synth",)
+    assert (
+        next(r for r in __import__("csv").DictReader(settings.tracker.open()))["x_handle"]
+        == "riley_synth"
+    )
+
+    rerun = load_existing(db, settings.data_directory, settings.tracker, settings.rules())
+    assert rerun["counts"]["people_already_present"] == 2
+    assert layer_counts(db) == counts
