@@ -81,9 +81,9 @@ flowchart LR
 |---|---|---|
 | 1 Sources | Grok scheduled task drops dated CSVs into `data/incoming/grok/{founders,VPs}/`; LinkedIn CSVs into `data/incoming/linkedin/` | ✅ Grok, LinkedIn · ⬜ hiring-signal feeds |
 | 2 Ingest | Header mapping, Pydantic validation, content fingerprints so reruns never duplicate, deterministic identity match (email / LinkedIn URL), ambiguous matches held for review | ✅ |
-| 3 Enrich | Fill missing LinkedIn URL and work email through a provider waterfall (Clay → Vibe Prospecting → manual), verify email deliverability, record which provider supplied each field | ⬜ next |
+| 3 Enrich | Fill missing LinkedIn URL and work email through a provider waterfall (Clay → Vibe Prospecting → manual), verify email deliverability, record which provider supplied each field; promote staging → silver → golden | ⬜ next |
 | 4 Research & Score | **Account research** (once per company: hiring, funding, tools) and **person research** (recent posts, talks, role history, public priorities), both with cited sources; fixed Python policy computes account fit, lead fit, intent, engagement → tier and next action. Missing evidence stays unscored, never guessed | ✅ account receipts and policy · ⬜ person research · 🟡 automatic research of new accounts |
-| 5 Outbound | Generate a 3-touch email sequence and a LinkedIn connection note from each person's `signal` and `outreach_angle`; nothing sends without approval | ⬜ |
+| 5 Outbound | Generate a 3-touch email sequence and a LinkedIn connection note from each **golden** person's `signal` and `outreach_angle`; nothing sends without approval | ⬜ |
 | 6 Track | Replies, connection acceptance, and **calls booked** (Cal.com/Calendly webhook) update status, engagement score, deals, and follow-ups; DNC and closed people get no actions | ✅ manual logging and follow-ups · ⬜ reply detection · ⬜ booking webhook |
 | 7 Report | Aggregate funnel metrics without exposing prospect data | ✅ `gtm portfolio-report` · ⬜ live dashboard |
 
@@ -136,27 +136,125 @@ flowchart TB
 fills blanks, so it is buried in `source_data` and never reaches scoring or outreach.
 Sends and replies are not rows, so "which signal gets replies?" cannot be answered.
 
-### Target: three zones
+### Target: layered warehouse (raw → staging → silver → golden)
 
 ```mermaid
 flowchart LR
-    RAW[Raw zone<br/>data/raw/YYYY-MM-DD/<br/>every input file, immutable] --> CORE
-    CORE[(CRM warehouse<br/>hosted Postgres · Supabase/Neon)] --> VIEW[Editable views<br/>prospects.csv · companies.csv · deals.csv]
-    VIEW -->|manual edits sync back| CORE
-    CORE --> INS[Insights<br/>SQL views · dashboard]
+    SRC[Grok / LinkedIn CSVs] --> RAW[raw<br/>every file and row as written<br/>append-only]
+    RAW --> STG[staging<br/>clean, deduplicated<br/>no email, no LinkedIn yet]
+    STG -->|email OR LinkedIn found| SIL[silver<br/>one of the two]
+    STG -->|both found| GLD[golden<br/>verified email AND LinkedIn]
+    SIL -->|missing one found| GLD
+    GLD --> OUT[outbound<br/>messages · events · tasks · deals]
+    GLD --> VIEW[Editable CSV views]
+    VIEW -->|validated write-back| GLD
+    OUT --> INS[Insights<br/>SQL views · dashboard]
     INS -->|weekly| FB[Feedback: Grok brief + score weights]
 ```
 
-**Hosted Postgres (Supabase or Neon) is the system of record** — chosen over local SQLite
-because webhooks (Clay, Cal.com), cloud scheduled jobs, and AI tools must all reach it.
-Schema changes go through versioned migrations; `DATABASE_URL` lives only in `.env` /
-GitHub Actions secrets. Raw files are mirrored to object storage (Supabase Storage).
-CSVs are generated views; edits made in them are validated and written back in a
-transaction. Daily backups (provider point-in-time recovery plus a nightly dump).
+**Neon Postgres is the system of record.** It was picked over local SQLite because
+webhooks (Clay, Cal.com), cloud scheduled jobs and AI tools must all reach it, and over
+Supabase because of instant copy-on-write branches: migrations, data migration and tests run
+on a branch first. One database, one schema per layer. Schema changes go through versioned
+migrations. `DATABASE_URL` lives only in `.env` and GitHub Actions secrets. Raw files are
+also copied unchanged to `data/raw/YYYY-MM-DD/` and mirrored to object storage. Daily
+backups: provider point-in-time recovery plus a nightly dump. Postgres stays the system of
+record at scale. If heavy analytics are ever needed, a copy streams to a columnar warehouse
+for reporting only.
+
+| Schema | Holds | Rule |
+|---|---|---|
+| `raw` | `files`, `grok_rows`, `provider_responses` | Append-only. Nothing is edited or deleted. Rows that fail validation still land here, with the errors. |
+| `core` | `prospect_registry`, `companies`, `signals`, `enrichment`, `person_research`, `account_research`, `score_snapshots` | Data about a person or account at any layer |
+| `staging` | `prospects` | Clean, deduplicated, no email and no LinkedIn URL yet |
+| `silver` | `prospects` | Verified email **or** LinkedIn URL, not both |
+| `golden` | `prospects` | Verified email **and** LinkedIn URL. **Outbound reads only this.** |
+| `outbound` | `messages`, `events`, `tasks`, `deals` | Every row points to a golden prospect |
+| `ops` | `pipeline_runs`, `state_transitions`, `ai_outputs` | Observability across all layers |
+
+#### Grok column contract is kept in every layer
+
+The Grok bot writes 13 columns:
+`name, title, company, company_website, country, city, linkedin_url, x_handle, source_url, signal, signal_date, why_fit, outreach_angle`.
+
+- `raw.grok_rows` stores the 13 columns exactly as written, all as text. The only extra
+  columns are `raw_row_id`, `file_id`, `row_number`, `segment` (founders / VPs),
+  `ingested_at`, `validation_status` and `validation_errors`.
+- `staging.prospects`, `silver.prospects` and `golden.prospects` share **one identical
+  column set**. It starts with the same 13 names, validated and typed (`signal_date` as a
+  date, `linkedin_url` normalized). The 5 signal columns on a prospect hold the latest
+  signal; the full history is in `core.signals`.
+- Columns that Grok does not supply are appended after the 13 and never rename them.
+
+#### Promotion rules
+
+| Layer | Requires |
+|---|---|
+| `staging` | Passes validation, `name`, `title`, `company`, identity resolved (no open duplicate review) |
+| `silver` | Staging requirements **and** (`email_status = verified` **or** `linkedin_url`) |
+| `golden` | Staging requirements **and** `email_status = verified` **and** `linkedin_url` |
+
+- Each person has **one `prospect_id` for life**, registered in `core.prospect_registry`
+  with their current `layer`. They live in exactly one of `staging`, `silver` or `golden`
+  at a time.
+- Promotion moves the row, updates `layer` and writes a `state_transitions` row in one
+  transaction. Enrichment only searches for what is missing (silver needs one field).
+- Check constraints enforce each layer's requirements in the database, not only in code.
+- A golden prospect with outbound history is never moved out. A later bounce sets
+  `email_status = bounced`, which blocks email sends; LinkedIn stays allowed.
+
+#### Foreign keys and CRM hygiene
+
+```
+core.prospect_registry (prospect_id)
+ ├── staging / silver / golden .prospects   prospect_id → registry
+ ├── core.signals, core.enrichment, core.person_research, core.score_snapshots
+ ├── ops.state_transitions, ops.ai_outputs (entity = prospect)
+ └── golden.prospects (prospect_id)
+      ├── outbound.messages   prospect_id → golden.prospects, signal_id → core.signals
+      ├── outbound.events     prospect_id → golden.prospects, message_id → messages
+      ├── outbound.tasks      prospect_id → golden.prospects
+      └── outbound.deals      primary_prospect_id → golden.prospects
+```
+
+- Data created before a person is golden (signals, enrichment, research, transitions)
+  points to the registry, so it never breaks when the person moves layers. Outbound
+  points to `golden.prospects`, so nothing can be drafted or sent to a non-golden person.
+- Referenced prospects cannot be deleted (`ON DELETE RESTRICT`). Opt-outs set
+  `do_not_contact`; history stays.
+- Unique normalized `linkedin_url` and unique `email` across all three prospect tables.
+- Check constraints on every status column (`layer`, `email_status`, `tier`,
+  `lifecycle_stage`, `lead_status`, `reply_status`, `channel`, `event_type`).
+- `lifecycle_stage` changes only through transition code that writes `state_transitions`.
+  `updated_at` is set by trigger.
+- `pipeline_runs` describes a whole job, so it has no prospect key.
 
 ### CRM tables and columns
 
-**companies** (accounts)
+**prospects** (`staging`, `silver`, `golden`: identical columns)
+
+| Column | Notes |
+|---|---|
+| `prospect_id`, `company_id` | |
+| `name`, `title`, `company`, `company_website`, `country`, `city`, `linkedin_url`, `x_handle`, `source_url`, `signal`, `signal_date`, `why_fit`, `outreach_angle` | **Grok contract, same names and order** |
+| `segment` (founders / VPs) | from the Grok folder |
+| `email`, `email_status` (verified / risky / invalid / bounced / unknown), `email_source`, `domain` | |
+| `seniority` (founder / c_suite / vp / head), `function` (founder / marketing / content / sales / revenue) | derived from title rule |
+| `timezone` | |
+| `lifecycle_stage` | new → contactable → contacted → engaged → meeting → opportunity → won / lost / nurture |
+| `lead_status` (open / in_sequence / replied / unresponsive / bad_fit) | |
+| `connection_status` (none / requested / connected) | LinkedIn |
+| `reply_status` (none / positive / neutral / negative / ooo) | latest reply |
+| `touches_count`, `last_contacted_at`, `last_replied_at`, `next_followup_at` | |
+| `lead_score`, `tier`, `score_model_version` | |
+| `consulting_stage`, `job_stage` | two independent pipelines, as today |
+| `do_not_contact`, `unsubscribed_at`, `bounce_count` | compliance |
+| `owner`, `notes`, `original_source`, `created_at`, `updated_at` | |
+
+**core.prospect_registry**: `prospect_id`, `layer` (staging / silver / golden),
+`first_raw_row_id`, `created_at`, `promoted_at`.
+
+**core.companies** (accounts)
 
 | Column | Notes |
 |---|---|
@@ -171,91 +269,75 @@ transaction. Daily backups (provider point-in-time recovery plus a nightly dump)
 | `lifecycle_stage` | target → engaged → opportunity → customer / lost / nurture |
 | `owner`, `original_source`, `created_at`, `updated_at` | |
 
-**people** (contacts)
+**core.signals** (append-only, the heart of signal-based outbound; Grok names kept)
 
 | Column | Notes |
 |---|---|
-| `person_id`, `company_id` | |
-| `first_name`, `last_name`, `full_name`, `job_title` | |
-| `seniority` (founder / c_suite / vp / head), `function` (founder / marketing / content / sales / revenue) | derived from title rule |
-| `segment` (founders / gtm_leaders) | |
-| `email`, `email_status` (verified / risky / invalid / unknown), `email_source` | |
-| `linkedin_url`, `x_handle`, `country`, `city`, `timezone` | |
-| `lifecycle_stage` | new → contactable → contacted → engaged → meeting → opportunity → won / lost / nurture |
-| `lead_status` (open / in_sequence / replied / unresponsive / bad_fit) | |
-| `connection_status` (none / requested / connected) | LinkedIn |
-| `reply_status` (none / positive / neutral / negative / ooo) | latest reply |
-| `touches_count`, `last_contacted_at`, `last_replied_at`, `next_followup_at` | |
-| `lead_score`, `tier`, `score_model_version` | |
-| `consulting_stage`, `job_stage` | two independent pipelines, as today |
-| `do_not_contact`, `unsubscribed_at`, `bounce_count` | compliance |
-| `owner`, `notes`, `original_source`, `created_at`, `updated_at` | |
-
-**signals** (append-only — the heart of signal-based outbound)
-
-| Column | Notes |
-|---|---|
-| `signal_id`, `person_id`, `company_id` | person optional for company-level signals |
+| `signal_id`, `prospect_id`, `company_id`, `raw_row_id` | prospect optional for company-level signals |
+| `signal`, `signal_date`, `source_url`, `why_fit`, `outreach_angle` | Grok names |
 | `signal_type` | funding / new_role / job_post / launch / pain_post / expansion / other |
-| `summary`, `signal_date`, `source_url`, `source` (grok / linkedin / job_board) | |
+| `source` (grok / linkedin / job_board) | |
 | `strength` (strong / moderate / weak), `first_seen_at`, `expires_at` | freshness window, default 30 days |
-| `why_fit`, `outreach_angle` | from Grok |
 | `used_in_message_id` | which touch used it |
 
-**deals** (opportunities — consulting contracts and job opportunities)
+**outbound.deals** (opportunities: consulting contracts and job opportunities)
 
 | Column | Notes |
 |---|---|
-| `deal_id`, `company_id`, `primary_person_id` | |
+| `deal_id`, `company_id`, `primary_prospect_id` | |
 | `pipeline` (consulting / job), `stage` | stages from `config/gtm.yaml` |
 | `engagement_type` (full_time / contract / project), `role_title`, `job_post_url` | |
 | `amount`, `currency`, `rate_type` (salary / hourly / fixed) | |
 | `expected_close_date`, `closed_at`, `lost_reason`, `next_step` | |
 | `created_from_signal_id`, `created_at`, `updated_at` | attribution |
 
-**messages** (every touch)
+**outbound.messages** (every touch)
 
 | Column | Notes |
 |---|---|
-| `message_id`, `person_id`, `signal_id`, `deal_id` | |
+| `message_id`, `prospect_id`, `signal_id`, `deal_id`, `ai_output_id` | |
 | `channel` (email / linkedin), `sequence_name`, `step` (1–3) | |
 | `angle`, `template_version`, `subject`, `body` | |
 | `status` (draft / approved / sent / bounced / cancelled) | |
 | `approved_at`, `sent_at`, `external_message_id`, `thread_id` | for reply matching |
 
-**events** (activities — observed facts only)
+**outbound.events** (activities, observed facts only)
 
 | Column | Notes |
 |---|---|
-| `event_id`, `person_id`, `deal_id`, `message_id` | |
+| `event_id`, `prospect_id`, `deal_id`, `message_id` | |
 | `event_type` | connection_requested / connection_accepted / reply / positive_reply / meeting_booked / meeting_held / interview / offer / hired / won / lost / unsubscribe / bounce / note |
 | `occurred_at`, `recorded_by` (human / sync), `notes` | |
 
-**tasks** (follow-ups): `task_id`, `person_id`, `deal_id`, `type`, `due_at`, `status`,
-`completed_at`, `rule` — replaces today's derived action hashes.
+**outbound.tasks** (follow-ups): `task_id`, `prospect_id`, `deal_id`, `type`, `due_at`,
+`status`, `completed_at`, `rule`. Replaces today's derived action hashes.
 
-**enrichment**: `entity_type`, `entity_id`, `field`, `value`, `provider`, `confidence`,
-`found_at` — provenance for every enriched value.
+**raw.provider_responses**: `response_id`, `provider`, `prospect_id`, `request`,
+`response`, `run_id`, `received_at`. Every enrichment call's payload, unchanged.
 
-**score_snapshots**: `person_id`, `snapshot_date`, component scores, `tier`,
-`model_version` — lets us check whether Tier 1 actually converts.
+**core.enrichment**: `prospect_id` or `company_id`, `field`, `value`, `provider`,
+`confidence`, `found_at`, `response_id`. Provenance for every enriched value.
 
-**person_research**: `research_id`, `person_id`, `researched_at`, `recent_posts`
+**core.score_snapshots**: `prospect_id`, `snapshot_date`, component scores, `tier`,
+`model_version`. Lets us check whether Tier 1 actually converts.
+
+**core.person_research**: `research_id`, `prospect_id`, `researched_at`, `recent_posts`
 (summaries + URLs), `talks_podcasts`, `role_history`, `stated_priorities`,
 `personalization_hooks`, `sources` (URLs), `confidence`, `ai_output_id`. Outreach angles
 must cite at least one source from here or from account research.
 
-**account_research**: today's JSON receipts moved into a table — `company_id`,
+**core.account_research**: today's JSON receipts moved into a table: `company_id`,
 `researched_at`, findings with sources, `status`, `profile_hash`, `ai_output_id`.
 
-**state_transitions**: `person_id`, `from_state`, `to_state`, `at`, `run_id`, `actor`
-(system / human), `reason`. Full history of every person's journey.
+**ops.state_transitions**: `prospect_id`, `from_layer`, `to_layer`, `from_state`,
+`to_state`, `at`, `run_id`, `actor` (system / human), `reason`. Full history of every
+person's journey through layers and lifecycle stages.
 
-**pipeline_runs**: `run_id`, `job` (import / enrich / research / draft / reply_sync /
-booking), `started_at`, `finished_at`, `status`, `rows_in`, `rows_ok`, `rows_failed`,
-`error_summary`.
+**ops.pipeline_runs**: `run_id`, `job` (import / enrich / promote / research / draft /
+reply_sync / booking), `started_at`, `finished_at`, `status`, `rows_in`, `rows_ok`,
+`rows_failed`, `error_summary`.
 
-**ai_outputs**: `ai_output_id`, `task` (research / angle / draft / classify_reply),
+**ops.ai_outputs**: `ai_output_id`, `task` (research / angle / draft / classify_reply),
 `entity_type`, `entity_id`, `model`, `prompt_version`, `input_hash`, `output`,
 `sources`, `run_id`, `created_at`. Every AI result is stored and traceable.
 
@@ -263,11 +345,14 @@ booking), `started_at`, `finished_at`, `status`, `rows_in`, `rows_ok`, `rows_fai
 
 ```mermaid
 stateDiagram-v2
-    [*] --> scraped
+    [*] --> scraped: raw row validated, in staging
     scraped --> researched
     researched --> enriched
-    enriched --> ready: contactable + tier + cited angle
-    enriched --> needs_manual: no email / LinkedIn found
+    enriched --> golden: verified email + LinkedIn URL
+    enriched --> silver_waiting: only one of the two found
+    silver_waiting --> golden: missing one found
+    enriched --> needs_manual: neither found
+    golden --> ready: fresh signal (≤30 days) + tier + cited angle
     ready --> in_sequence: first touch approved and sent
     in_sequence --> replied
     in_sequence --> unresponsive: sequence finished
@@ -280,7 +365,10 @@ stateDiagram-v2
     unresponsive --> nurture
 ```
 
-- Each person is in exactly one state; every change writes a `state_transitions` row.
+- Each person is in exactly one layer and one state; every change writes a
+  `state_transitions` row.
+- Golden is about data quality, `ready` is about timing. A golden person whose signal is
+  older than 30 days stays golden but gets no outreach until a fresh signal arrives.
 - Every job writes a `pipeline_runs` row; every AI call writes an `ai_outputs` row.
 - **Daily "stuck" report:** people over the time limit in a state (e.g. `scraped` > 2
   days, `ready` > 3 days, `replied` without follow-up > 1 day), failed runs, and
@@ -290,8 +378,8 @@ stateDiagram-v2
 
 ### Reading past data
 
-- `gtm sql "<query>"`, `psql`, or the Supabase SQL editor for ad-hoc questions.
-- Supabase table editor (or Metabase) to browse and filter every table.
+- `gtm sql "<query>"`, `psql`, or the Neon SQL editor for ad-hoc questions.
+- Neon console tables view (or Metabase) to browse and filter every table.
 - A read-only Postgres MCP connection so Claude can answer questions over the
   warehouse ("which signals got positive replies this month?").
 - Saved SQL views feeding the dashboard:
@@ -306,10 +394,15 @@ stateDiagram-v2
 
 ### Migration
 
-Current `prospects.csv` columns map onto `people`, `companies`, and `signals`
-(`signal`, `signal_date`, `source_url`, `why_fit`, `outreach_angle` become each person's
-first signal row; `source_data` history is replayed into further signal rows).
-`activity_history` becomes `events`. Existing IDs are kept. The old CSV stays readable.
+Current `prospects.csv` columns map onto `prospects`, `companies`, and `signals`, renamed
+to the Grok contract (`full_name` → `name`, `job_title` → `title`, `company_name` →
+`company`, `website` → `company_website`). `signal`, `signal_date`, `source_url`,
+`why_fit`, `outreach_angle` become each person's first signal row; `source_data` history
+is replayed into further signal rows. Each person is placed in `staging`, `silver` or
+`golden` by the promotion rules. Original Grok files are loaded into `raw`.
+`activity_history` becomes `events`. Existing IDs become `prospect_id`. The old CSV stays
+readable. The migration runs on a Neon branch first, with row counts per layer before and
+after.
 
 ## Outbound design (planned)
 
@@ -358,8 +451,9 @@ first signal row; `source_data` history is replayed into further signal rows).
 ## Roadmap
 
 1. ✅ Repo, backup rotation, file-naming contract, Grok brief, ICP rule
-2. ⬜ Warehouse: hosted Postgres with all CRM, research, lifecycle, run, and AI-output
-   tables; raw zone; CSV views; migration of existing data; `gtm sql`
+2. ⬜ Warehouse: Neon Postgres with raw → staging → silver → golden layers, `core`,
+   `outbound` and `ops` schemas; Grok column contract in every layer; promotion job;
+   CSV views; migration of existing data; `gtm sql`
 3. ⬜ Enrichment waterfall (Clay, Vibe Prospecting) and person research, writing
    provenance and sources to the warehouse
 4. ⬜ Outbound drafts from research, approval queue, reply detection, booking webhook
