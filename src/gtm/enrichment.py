@@ -17,7 +17,6 @@ import json
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -39,7 +38,6 @@ EMAIL_STATUS = {
     "invalid": "invalid",
     "undeliverable": "invalid",
 }
-PROVIDERS = ("clay", "vibe_prospecting", "manual")
 
 
 class Finding(BaseModel):
@@ -48,7 +46,7 @@ class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     prospect_id: str
-    provider: Literal["clay", "vibe_prospecting", "manual"]
+    provider: str = Field(pattern=r"^[a-z][a-z0-9_]{1,39}$")
     linkedin_url: str | None = None
     email: str | None = None
     email_status: str | None = None
@@ -76,12 +74,6 @@ class Finding(BaseModel):
         if mapped is None:
             raise ValueError(f"unknown email status {value!r}")
         return mapped
-
-
-class Enricher(Protocol):
-    name: str
-
-    def enrich(self, batch: list[dict]) -> list[Finding]: ...
 
 
 class FileEnricher:
@@ -140,15 +132,20 @@ def write_request(batch: list[dict], directory: Path) -> Path:
 
 
 def apply_findings(
-    conn: psycopg.Connection, findings: list[Finding], *, dry_run: bool = False
+    conn: psycopg.Connection,
+    findings: list[Finding],
+    *,
+    dry_run: bool = False,
+    run_id=None,
 ) -> dict:
     """Validate and apply findings; each person in its own transaction. Fill blanks only."""
     conn.autocommit = True
     counts: Counter = Counter()
     problems: list[str] = []
     planned: list[dict] = []
-    run = None
-    if not dry_run:
+    run = run_id
+    owns_run = run is None and not dry_run
+    if owns_run:
         run = conn.execute(
             "insert into ops.pipeline_runs (job, details) values ('enrich', %s) returning run_id",
             (Jsonb({"findings": len(findings)}),),
@@ -234,7 +231,7 @@ def apply_findings(
             counts["failed"] += 1
             problems.append(f"{f.prospect_id}: {type(exc).__name__} {exc.diag.constraint_name}")
 
-    if run:
+    if owns_run:
         conn.execute(
             "update ops.pipeline_runs set finished_at = now(), status = %s, rows_in = %s,"
             " rows_ok = %s, rows_failed = %s, details = details || %s where run_id = %s",
@@ -264,3 +261,75 @@ def match_rate(conn: psycopg.Connection, run_id: str) -> dict:
         (run_id,),
     ).fetchall()
     return {f"{p}.{f}": n for p, f, n in rows}
+
+
+PERSON_COLUMNS = ("prospect_id", "layer", "name", "title", "company", "company_website",
+                  "domain", "linkedin_url", "email", "email_status", "signal_date", "segment")  # fmt: skip
+
+
+def current_people(conn: psycopg.Connection, ids: list[str]) -> list[dict]:
+    rows = conn.execute(
+        "select " + ", ".join(PERSON_COLUMNS) + " from core.all_prospects"
+        " where prospect_id = any(%s::uuid[]) and not do_not_contact",
+        (ids,),
+    ).fetchall()
+    people = [dict(zip(PERSON_COLUMNS, r, strict=True)) for r in rows]
+    for p in people:
+        p["prospect_id"] = str(p["prospect_id"])
+    return people
+
+
+def needs(person: dict, stage: str) -> bool:
+    if person["layer"] == "golden":
+        return False
+    if stage == "linkedin_url":
+        return not person["linkedin_url"]
+    if stage == "email":
+        return not person["email"]
+    return bool(person["email"]) and person["email_status"] not in ("verified", "invalid")
+
+
+def run_waterfall(
+    conn: psycopg.Connection,
+    ids: list[str],
+    waterfall: dict[str, list[str]],
+    enrichers: dict,
+    *,
+    dry_run: bool = False,
+    only: set[str] | None = None,
+) -> dict:
+    """LinkedIn URL -> email -> verify. Each provider sees only people still missing the field."""
+    conn.autocommit = True
+    run = None
+    if not dry_run:
+        run = conn.execute(
+            "insert into ops.pipeline_runs (job, details) values ('enrich', %s) returning run_id",
+            (Jsonb({"waterfall": waterfall, "people": len(ids)}),),
+        ).fetchone()[0]
+    steps, errors = [], []
+    for stage in ("linkedin_url", "email", "verify"):
+        for name in waterfall.get(stage, []):
+            if only and name not in only:
+                continue
+            people = [p for p in current_people(conn, ids) if needs(p, stage)]
+            step = {"stage": stage, "provider": name, "asked": len(people)}
+            if dry_run:
+                # Planning only: never call a provider (calls can spend credits).
+                step["would_ask"] = [p["name"] for p in people]
+            elif people and stage in enrichers[name].stages:
+                findings = enrichers[name].find(stage, people)
+                errors += [e for p in people for e in p.get("errors", [])]
+                result = apply_findings(conn, findings, dry_run=dry_run, run_id=run)
+                step.update(found=len(findings), counts=result["counts"])
+                errors += result["problems"]
+            steps.append(step)
+    layers = Counter(p["layer"] for p in current_people(conn, ids))
+    if run:
+        conn.execute(
+            "update ops.pipeline_runs set finished_at = now(), status = %s, rows_in = %s,"
+            " rows_ok = %s, details = details || %s where run_id = %s",
+            ("partial" if errors else "succeeded", len(ids), len(ids),
+             Jsonb({"steps": steps, "errors": errors[:50]}), run),
+        )  # fmt: skip
+    return {"run_id": str(run) if run else None, "dry_run": dry_run, "steps": steps,
+            "layers_now": dict(layers), "errors": errors}  # fmt: skip

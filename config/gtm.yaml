@@ -76,3 +76,23 @@ scoring:
     seniority_alone: [cmo, cro, cco, cgo, cco & partner]
     exclude: [intern, assistant, associate, coordinator, analyst]
   relevant_titles: [marketing, growth, content, sales, revenue operations, revops, demand, brand, recruiter, talent]
+# Enrichment waterfall: each stage asks providers in order, only for people still missing
+# that field. Add a provider: write an adapter in src/gtm/enrichers/, register it, list it here.
+enrichment:
+  waterfall:
+    linkedin_url: [clay, deepline]
+    email: [clay, deepline]
+    verify: [deepline]
+  providers:
+    clay:
+      adapter: clay_results          # Clay runs via the Claude connection; results saved as JSON
+      results_dir: enrichment/clay
+    deepline:
+      adapter: deepline              # deepline CLI; credits are charged per call
+      linkedin_play: prebuilt/person-to-linkedin-harvestapi
+      email_play: prebuilt/person-to-email
+      verify_tool: bounceban_verify_single
+      timeout_seconds: 300
+    manual:
+      adapter: manual
+      results_dir: enrichment/manual

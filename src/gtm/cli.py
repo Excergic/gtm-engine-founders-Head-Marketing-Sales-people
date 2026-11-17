@@ -759,3 +759,32 @@ def enrich_apply(
         if result["run_id"]:
             result["found"] = match_rate(conn, result["run_id"])
     output(result)
+
+
+@enrich_app.command("run")
+@guarded
+def enrich_run(
+    limit: Annotated[int, typer.Option(min=1, max=500)] = 15,
+    layer: Annotated[str | None, typer.Option(help="staging or silver")] = None,
+    request: Annotated[Path | None, typer.Option(help="use the people in a request file")] = None,
+    only: Annotated[list[str] | None, typer.Option(help="run only these providers")] = None,
+    dry_run: Annotated[
+        bool, typer.Option(help="list who each provider would be asked about")
+    ] = False,
+):
+    """Run the configured waterfall: LinkedIn URL -> work email -> verify."""
+    import json as _json
+
+    from .enrichers import build, waterfall_config
+    from .enrichment import run_waterfall, select_batch
+
+    settings = Settings.load()
+    waterfall, providers = waterfall_config(settings.rules())
+    enrichers = {n: build(n, providers[n], settings.data_directory) for n in providers}
+    with warehouse_connection() as conn:
+        if request:
+            ids = [p["prospect_id"] for p in _json.loads(request.read_text())["people"]]
+        else:
+            ids = [p["prospect_id"] for p in select_batch(conn, limit, layer)]
+        output(run_waterfall(conn, ids, waterfall, enrichers, dry_run=dry_run,
+                             only=set(only) if only else None))  # fmt: skip

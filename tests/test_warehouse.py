@@ -720,3 +720,133 @@ def test_findings_reject_invented_looking_values(db):
     ):
         with pytest.raises(ValidationError):
             Finding(prospect_id=pid, provider="clay", **bad)
+
+
+# --- enrichment waterfall and provider adapters -------------------------------------------
+
+
+def _clay_file(directory, requests, contacts):
+    import json as _json
+
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "run.json").write_text(
+        _json.dumps({"requests": requests, "task": {"contacts": contacts}})
+    )
+
+
+def test_clay_adapter_only_accepts_the_requested_person(tmp_path):
+    from gtm.enrichers.clay import ClayResultsEnricher
+
+    clay_dir = tmp_path / "enrichment" / "clay"
+    _clay_file(
+        clay_dir,
+        [{"prospect_id": "p1", "contactName": "Jay Prakash", "companyIdentifier": "s.com"},
+         {"prospect_id": "p2", "contactName": "Ann Lee", "companyIdentifier": "a.com"}],
+        [{"name": "Jay Prakash, PhD", "companyIdentifier": "s.com",
+          "url": "https://www.linkedin.com/in/jay/",
+          "enrichments": [{"state": "completed", "value": '{"Work Email":"jp@s.com"}'}]},
+         {"name": "Someone Else", "companyIdentifier": "a.com",
+          "url": "https://www.linkedin.com/in/else/", "enrichments": []}],
+    )  # fmt: skip
+    clay = ClayResultsEnricher("clay", {"results_dir": "enrichment/clay"}, tmp_path)
+    people = [{"prospect_id": "p1", "name": "Jay Prakash"},
+              {"prospect_id": "p2", "name": "Ann Lee"}]  # fmt: skip
+    emails = clay.find("email", people)
+    assert [(f.prospect_id, f.email, f.email_status) for f in emails] == [("p1", "jp@s.com", None)]
+    links = clay.find("linkedin_url", people)
+    assert [(f.prospect_id, f.linkedin_url) for f in links] == [
+        ("p1", "https://www.linkedin.com/in/jay")
+    ]
+
+
+def test_deepline_adapter_maps_plays_and_verdicts(tmp_path):
+    from gtm.enrichers.deepline import DeeplineEnricher
+
+    calls = []
+
+    def runner(args, timeout):
+        calls.append(args[:3])
+        ref = args[2]
+        if ref == "li-play":
+            return {"result": {"output": {"linkedin_url": "https://linkedin.com/in/ann-lee"}}}
+        if ref == "email-play":
+            return {"output": {"email": "ann@a.com", "email_validated": False,
+                               "email_validation_status": "catch_all"}}  # fmt: skip
+        return {"toolResponse": {"rawV2": {"result": "deliverable", "score": 97}}}
+
+    deepline = DeeplineEnricher(
+        "deepline",
+        {"linkedin_play": "li-play", "email_play": "email-play", "verify_tool": "verify-tool"},
+        tmp_path,
+        runner=runner,
+    )
+    person = {"prospect_id": "p2", "name": "Ann Lee", "company": "A", "domain": "a.com",
+              "linkedin_url": None, "email": None}  # fmt: skip
+    (li,) = deepline.find("linkedin_url", [person])
+    assert li.linkedin_url == "https://www.linkedin.com/in/ann-lee"
+    (em,) = deepline.find("email", [person])
+    assert (em.email, em.email_status) == ("ann@a.com", "risky")
+    (ver,) = deepline.find("verify", [{**person, "email": "ann@a.com"}])
+    assert (ver.email_status, ver.confidence) == ("verified", 0.97)
+    assert calls == [["plays", "run", "li-play"], ["plays", "run", "email-play"],
+                     ["tools", "execute", "verify-tool"]]  # fmt: skip
+
+    def failing(args, timeout):
+        raise RuntimeError("insufficient credits")
+
+    broke = DeeplineEnricher("deepline", {"email_play": "x"}, tmp_path, runner=failing)
+    who = {**person}
+    assert broke.find("email", [who]) == []
+    assert who["errors"] == ["deepline.email: insufficient credits"]
+
+
+def test_waterfall_asks_each_provider_only_for_whats_still_missing(db):
+    from gtm.enrichment import Finding, run_waterfall
+
+    a = register(db, name="Ann Lee")  # needs LinkedIn + email
+    b = register(db, name="Bo Kim", linkedin_url=linkedin("bo"))  # needs email
+    asked = []
+
+    class Fake:
+        def __init__(self, name, answers):
+            self.name, self.answers = name, answers
+            self.stages = frozenset({"linkedin_url", "email", "verify"})
+
+        def find(self, stage, people):
+            asked.append((self.name, stage, sorted(p["name"] for p in people)))
+            out = []
+            for p in people:
+                value = self.answers.get((stage, p["name"]))
+                if value:
+                    field = {"verify": "email_status"}.get(stage, stage)
+                    extra = {"email": p["email"]} if stage == "verify" else {}
+                    out.append(Finding(prospect_id=p["prospect_id"], provider=self.name,
+                                       **{field: value}, **extra))  # fmt: skip
+            return out
+
+    first = Fake("first", {("linkedin_url", "Ann Lee"): "https://www.linkedin.com/in/ann",
+                           ("email", "Bo Kim"): "bo@b.com"})  # fmt: skip
+    second = Fake("second", {("email", "Ann Lee"): "ann@a.com",
+                             ("verify", "Ann Lee"): "deliverable",
+                             ("verify", "Bo Kim"): "undeliverable"})  # fmt: skip
+    waterfall = {"linkedin_url": ["first", "second"], "email": ["first", "second"],
+                 "verify": ["second"]}  # fmt: skip
+    ids = [str(a), str(b)]
+
+    plan = run_waterfall(db, ids, waterfall, {"first": first, "second": second}, dry_run=True)
+    assert asked == [] and plan["run_id"] is None  # a dry run never calls providers
+
+    result = run_waterfall(db, ids, waterfall, {"first": first, "second": second})
+    assert asked == [
+        ("first", "linkedin_url", ["Ann Lee"]),
+        # second is not asked for LinkedIn: nobody is missing it any more
+        ("first", "email", ["Ann Lee", "Bo Kim"]),
+        ("second", "email", ["Ann Lee"]),
+        ("second", "verify", ["Ann Lee", "Bo Kim"]),
+    ]
+    assert layer_of(db, a) == "golden"
+    assert layer_of(db, b) == "silver"  # undeliverable email: not golden
+    assert result["layers_now"] == {"golden": 1, "silver": 1}
+    assert db.execute("select count(distinct run_id) from core.enrichment").fetchone() == (
+        1,
+    )  # one run for the whole waterfall

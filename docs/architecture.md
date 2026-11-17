@@ -409,6 +409,27 @@ stateDiagram-v2
 In the view, signal columns are read-only (signals are append-only history) and a row
 changed in the warehouse after export is refused, so edits never overwrite newer data.
 
+### Enrichment providers (pluggable waterfall)
+
+Each provider is an adapter in `src/gtm/enrichers/` with one method,
+`find(stage, people) -> [Finding]`, for the stages it supports: `linkedin_url`, `email`,
+`verify`. The order per stage is in `config/gtm.yaml` → `enrichment.waterfall`; each
+provider is asked only about people still missing that field. `gtm enrich run` runs it
+(`--dry-run` lists who would be asked and never calls a provider; `--only` limits
+providers). Every finding is validated, its raw response stored in
+`raw.provider_responses`, its provenance in `core.enrichment`, and it fills blanks only.
+
+| Adapter | Stages | How it runs |
+|---|---|---|
+| `clay_results` | linkedin_url, email | Clay via the Claude connection; results saved to `data/enrichment/clay/` with the prospect each lookup was for |
+| `deepline` | linkedin_url, email, verify | `deepline` CLI: `prebuilt/person-to-linkedin-harvestapi`, `prebuilt/person-to-email`, `bounceban_verify_single` (IDs in config) |
+| `manual` | all | JSON typed in by a person, `data/enrichment/manual/` |
+
+New provider: write an adapter, decorate it with `@register("<adapter>")`, add it under
+`enrichment.providers` and to the waterfall. Golden still requires `email_status =
+verified`; providers that return no verdict (Clay) leave people in silver until a
+verifier runs.
+
 ### Reading past data
 
 - `gtm sql "<query>"`, `psql`, or the Neon SQL editor for ad-hoc questions.
