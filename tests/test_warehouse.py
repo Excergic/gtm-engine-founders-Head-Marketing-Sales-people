@@ -635,3 +635,88 @@ def test_view_edits_are_validated_and_applied_in_one_transaction(db, system):
     assert db.execute(
         "select count(*) from core.all_prospects where notes = 'batch'"
     ).fetchone() == (0,)
+
+
+# --- enrichment -------------------------------------------------------------------------------
+
+
+def test_enrichment_batch_prefers_silver_and_skips_golden_and_dnc(db):
+    from gtm.enrichment import select_batch
+
+    staged = register(db, signal_date="2026-11-10")
+    silver = register(
+        db, name="Li Only", linkedin_url=linkedin("li-only"), signal_date="2026-10-01"
+    )
+    golden(db, "gold")
+    blocked = register(db, name="No Contact")
+    update(db, blocked, do_not_contact=True)
+    batch = select_batch(db, 10)
+    assert [p["prospect_id"] for p in batch] == [str(silver), str(staged)]
+    assert batch[0]["needs"] == ["email"] and batch[1]["needs"] == ["linkedin_url", "email"]
+
+
+def test_findings_fill_blanks_record_provenance_and_promote(db):
+    from gtm.enrichment import Finding, apply_findings
+
+    silver = register(db, name="Li Only", linkedin_url=linkedin("li-only"))
+    staged = register(db, name="Nothing Yet")
+    risky = register(db, name="Risky Mail", linkedin_url=linkedin("risky"))
+    other = golden(db, "taken")
+    findings = [
+        Finding(prospect_id=str(silver), provider="clay", email="Li@Example.com",
+                email_status="valid", confidence=0.9, response={"raw": 1}),
+        Finding(prospect_id=str(staged), provider="vibe_prospecting",
+                linkedin_url="linkedin.com/in/nothing-yet/"),
+        Finding(prospect_id=str(risky), provider="clay", email="r@example.com",
+                email_status="catch-all"),
+        # Different LinkedIn for someone who already has one: kept, reported.
+        Finding(prospect_id=str(silver), provider="vibe_prospecting",
+                linkedin_url=linkedin("someone-else")),
+        # Email that already belongs to another person: not applied.
+        Finding(prospect_id=str(staged), provider="clay", email="taken@example.com",
+                email_status="verified"),
+    ]  # fmt: skip
+
+    preview = apply_findings(db, findings, dry_run=True)
+    assert preview["run_id"] is None and layer_of(db, silver) == "silver"
+
+    result = apply_findings(db, findings)
+    assert layer_of(db, silver) == "golden"
+    assert layer_of(db, staged) == "silver"
+    assert layer_of(db, risky) == "silver"  # catch-all is risky, not verified
+    assert result["counts"]["promoted_silver_to_golden"] == 1
+    assert result["counts"]["promoted_staging_to_silver"] == 1
+    assert result["counts"]["conflicting_value_kept"] == 1
+    assert result["counts"]["possible_duplicate"] == 1
+    assert db.execute(
+        "select email, email_status, linkedin_url from golden.prospects where prospect_id = %s",
+        (silver,),
+    ).fetchone() == ("li@example.com", "verified", linkedin("li-only"))
+    assert db.execute(
+        "select provider, field, value from core.enrichment where prospect_id = %s"
+        " order by provider, field",
+        (silver,),
+    ).fetchall() == [
+        ("clay", "email", "li@example.com"),
+        ("clay", "email_status", "verified"),
+        ("vibe_prospecting", "linkedin_url", linkedin("someone-else")),
+    ]
+    assert db.execute("select count(*) from raw.provider_responses").fetchone() == (5,)
+    assert db.execute(
+        "select email from golden.prospects where prospect_id = %s", (other,)
+    ).fetchone() == ("taken@example.com",)
+
+
+def test_findings_reject_invented_looking_values(db):
+    from pydantic import ValidationError
+
+    from gtm.enrichment import Finding
+
+    pid = str(register(db))
+    for bad in (
+        {"linkedin_url": "https://www.linkedin.com/company/acme"},
+        {"email": "not-an-email"},
+        {"email": "a@b.com", "email_status": "probably fine"},
+    ):
+        with pytest.raises(ValidationError):
+            Finding(prospect_id=pid, provider="clay", **bad)

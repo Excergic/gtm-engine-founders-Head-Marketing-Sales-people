@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
@@ -52,6 +53,8 @@ research_app = typer.Typer(help="Evidence-backed account research; no automatic 
 app.add_typer(research_app, name="research")
 db_app = typer.Typer(help="Postgres warehouse (DATABASE_URL in .env): migrations and status.")
 app.add_typer(db_app, name="db")
+enrich_app = typer.Typer(help="Find missing LinkedIn URLs and verified emails; fill blanks only.")
+app.add_typer(enrich_app, name="enrich")
 
 
 def output(value):
@@ -715,3 +718,44 @@ def db_apply_edits(by: Annotated[str, typer.Option(help="who made the edits")] =
         output(result)
         if result["errors"]:
             raise typer.Exit(1)
+
+
+@enrich_app.command("batch")
+@guarded
+def enrich_batch(
+    limit: Annotated[int, typer.Option(min=1, max=500)] = 15,
+    layer: Annotated[str | None, typer.Option(help="staging or silver")] = None,
+    dry_run: Annotated[bool, typer.Option(help="show the batch without writing a file")] = False,
+):
+    """Pick people missing a LinkedIn URL or verified email; write a request file."""
+    from .enrichment import select_batch, write_request
+
+    settings = Settings.load()
+    with warehouse_connection() as conn:
+        batch = select_batch(conn, limit, layer)
+    summary = {
+        "people": len(batch),
+        "by_layer": dict(Counter(p["layer"] for p in batch)),
+        "needs": dict(Counter(n for p in batch for n in p["needs"])),
+    }
+    if not dry_run:
+        path = write_request(batch, settings.data_directory / "enrichment" / "requests")
+        summary["request_file"] = str(path)
+    output(summary)
+
+
+@enrich_app.command("apply")
+@guarded
+def enrich_apply(
+    findings_file: Path,
+    dry_run: Annotated[bool, typer.Option(help="validate and show changes only")] = False,
+):
+    """Apply provider findings (JSON) to the warehouse: provenance + fill blanks + promote."""
+    from .enrichment import FileEnricher, apply_findings, match_rate
+
+    findings = FileEnricher(findings_file).enrich([])
+    with warehouse_connection() as conn:
+        result = apply_findings(conn, findings, dry_run=dry_run)
+        if result["run_id"]:
+            result["found"] = match_rate(conn, result["run_id"])
+    output(result)
