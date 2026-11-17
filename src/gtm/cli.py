@@ -771,9 +771,14 @@ def enrich_run(
     dry_run: Annotated[
         bool, typer.Option(help="list who each provider would be asked about")
     ] = False,
+    all_people: Annotated[
+        bool,
+        typer.Option("--all", help="every non-golden prospect once, in batches of --limit"),
+    ] = False,
 ):
     """Run the configured waterfall: LinkedIn URL -> work email -> verify."""
     import json as _json
+    from datetime import UTC, datetime
 
     from .enrichers import build, waterfall_config
     from .enrichment import run_waterfall, select_batch
@@ -781,10 +786,43 @@ def enrich_run(
     settings = Settings.load()
     waterfall, providers = waterfall_config(settings.rules())
     enrichers = {n: build(n, providers[n], settings.data_directory) for n in providers}
+    selected = set(only) if only else None
     with warehouse_connection() as conn:
-        if request:
-            ids = [p["prospect_id"] for p in _json.loads(request.read_text())["people"]]
-        else:
-            ids = [p["prospect_id"] for p in select_batch(conn, limit, layer)]
-        output(run_waterfall(conn, ids, waterfall, enrichers, dry_run=dry_run,
-                             only=set(only) if only else None))  # fmt: skip
+        if not all_people:
+            if request:
+                ids = [p["prospect_id"] for p in _json.loads(request.read_text())["people"]]
+            else:
+                ids = [p["prospect_id"] for p in select_batch(conn, limit, layer)]
+            output(run_waterfall(conn, ids, waterfall, enrichers, dry_run=dry_run,
+                                 only=selected))  # fmt: skip
+            return
+
+        # Snapshot the list once so people who stay unfound are not asked again.
+        ids = [p["prospect_id"] for p in select_batch(conn, 1_000_000, layer)]
+        conn.commit()
+        runs_dir = settings.data_directory / "enrichment" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
+        found: Counter = Counter()
+        batches, errors = 0, []
+        for start in range(0, len(ids), limit):
+            chunk = ids[start : start + limit]
+            result = run_waterfall(conn, chunk, waterfall, enrichers, dry_run=dry_run,
+                                   only=selected)  # fmt: skip
+            batches += 1
+            if not dry_run:
+                path = runs_dir / f"{stamp}_batch{batches:03d}.json"
+                path.write_text(_json.dumps(result, indent=2, default=str))
+            for step in result["steps"]:
+                found[f"{step['stage']}.{step['provider']}"] += step.get("found") or 0
+            errors += result["errors"]
+            typer.echo(
+                f"batch {batches}: {start + len(chunk)}/{len(ids)} people,"
+                f" layers {result['layers_now']}, errors {len(result['errors'])}",
+                err=True,
+            )
+            if any("credit" in str(e).lower() for e in result["errors"]):
+                typer.echo("stopping: provider reports a credit problem", err=True)
+                break
+        output({"people": len(ids), "batches": batches, "found": dict(found),
+                "errors": errors[:50], "error_count": len(errors)})  # fmt: skip

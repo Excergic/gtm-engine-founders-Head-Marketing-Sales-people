@@ -764,14 +764,17 @@ def test_deepline_adapter_maps_plays_and_verdicts(tmp_path):
 
     calls = []
 
+    # Shapes copied from real `deepline plays run --json --full` / `tools execute` output.
     def runner(args, timeout):
-        calls.append(args[:3])
+        calls.append(args)
         ref = args[2]
         if ref == "li-play":
-            return {"result": {"output": {"linkedin_url": "https://linkedin.com/in/ann-lee"}}}
+            return {"run": {"status": "completed"}, "result": {
+                "linkedin_url": "https://www.linkedin.com/in/ann-lee",
+                "identity_validation_status": "verified"}}  # fmt: skip
         if ref == "email-play":
-            return {"output": {"email": "ann@a.com", "email_validated": False,
-                               "email_validation_status": "catch_all"}}  # fmt: skip
+            return {"result": {"email": "ann@a.com", "email_validated": False,
+                               "email_validation_status": "catch_all", "miss_reason": None}}  # fmt: skip
         return {"toolResponse": {"rawV2": {"result": "deliverable", "score": 97}}}
 
     deepline = DeeplineEnricher(
@@ -788,8 +791,30 @@ def test_deepline_adapter_maps_plays_and_verdicts(tmp_path):
     assert (em.email, em.email_status) == ("ann@a.com", "risky")
     (ver,) = deepline.find("verify", [{**person, "email": "ann@a.com"}])
     assert (ver.email_status, ver.confidence) == ("verified", 0.97)
-    assert calls == [["plays", "run", "li-play"], ["plays", "run", "email-play"],
-                     ["tools", "execute", "verify-tool"]]  # fmt: skip
+    assert [c[:3] for c in calls] == [["plays", "run", "li-play"], ["plays", "run", "email-play"],
+                                      ["tools", "execute", "verify-tool"]]  # fmt: skip
+    assert "--full" in calls[0] and "--full" in calls[1]
+
+    # A miss: candidates rejected inside the play's waterfall must never be used.
+    def missing(args, timeout):
+        if args[2] == "li-play":
+            return {"result": {"linkedin_url": None, "identity_validation_status": "rejected",
+                               "waterfall_attempts": {"primary": {
+                                   "linkedin_url": "https://www.linkedin.com/in/someone-else"}}}}  # fmt: skip
+        return {"result": {"email": None, "miss_reason": "no_valid_email",
+                           "waterfall_attempts": {"x": {"email": "guess@a.com"}}}}  # fmt: skip
+
+    miss = DeeplineEnricher("deepline", {"linkedin_play": "li-play", "email_play": "e"},
+                            tmp_path, runner=missing)  # fmt: skip
+    assert miss.find("linkedin_url", [{**person}]) == []
+    assert miss.find("email", [{**person}]) == []
+
+    # A preview without a result is an error, not a silent miss.
+    preview = DeeplineEnricher("deepline", {"email_play": "e"}, tmp_path,
+                               runner=lambda a, t: {"run": {"status": "completed"}})  # fmt: skip
+    who = {**person}
+    assert preview.find("email", [who]) == []
+    assert who["errors"] == ["deepline.email: play response has no result object"]
 
     def failing(args, timeout):
         raise RuntimeError("insufficient credits")

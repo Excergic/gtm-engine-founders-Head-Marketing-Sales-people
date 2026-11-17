@@ -34,24 +34,6 @@ def _cli(args: list[str], timeout: int) -> dict:
     return json.loads(done.stdout)
 
 
-def first(data, *keys):
-    """First non-empty value for any of ``keys`` anywhere in nested JSON."""
-    if isinstance(data, dict):
-        for key in keys:
-            if data.get(key) not in (None, ""):
-                return data[key]
-        for value in data.values():
-            found = first(value, *keys)
-            if found not in (None, ""):
-                return found
-    elif isinstance(data, list):
-        for value in data:
-            found = first(value, *keys)
-            if found not in (None, ""):
-                return found
-    return None
-
-
 def split_name(name: str) -> tuple[str, str]:
     tokens = [t for t in name_tokens(name) if re.fullmatch(r"[\w'-]+", t)]
     words = [w for w in re.split(r"[\s,]+", name) if w.strip(".").casefold() in tokens]
@@ -69,8 +51,21 @@ class DeeplineEnricher:
         self.runner = runner or _cli
 
     def _run(self, kind: str, ref: str, payload: dict) -> dict:
-        verb = ["plays", "run", ref] if kind == "play" else ["tools", "execute", ref]
-        return self.runner([*verb, "--input", json.dumps(payload)], self.timeout)
+        if kind == "play":
+            # --full: without it the CLI prints a bounded preview with no play result.
+            args = ["plays", "run", ref, "--input", json.dumps(payload), "--full"]
+        else:
+            args = ["tools", "execute", ref, "--input", json.dumps(payload)]
+        return self.runner(args, self.timeout)
+
+    @staticmethod
+    def _result(response: dict) -> dict:
+        """The play's own output. Only this is trusted: the waterfall attempts nested
+        inside it can hold candidates the play rejected."""
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("play response has no result object")
+        return result
 
     def find(self, stage: str, people: list[dict]) -> list[Finding]:
         findings = []
@@ -93,8 +88,9 @@ class DeeplineEnricher:
         if person.get("domain"):
             payload["domain"] = person["domain"]
         response = self._run("play", self.settings["linkedin_play"], payload)
-        url = first(response, "linkedin_url")
-        if not url:
+        result = self._result(response)
+        url = result.get("linkedin_url")
+        if not url or result.get("identity_validation_status") != "verified":
             return None
         return Finding(prospect_id=person["prospect_id"], provider=self.name, linkedin_url=url,
                        confidence=0.7, request=payload, response=response)  # fmt: skip
@@ -108,11 +104,12 @@ class DeeplineEnricher:
         if not payload:
             return None
         response = self._run("play", self.settings["email_play"], payload)
-        email = first(response, "email")
-        if not email:
+        result = self._result(response)
+        email = result.get("email")
+        if not email or result.get("miss_reason"):
             return None
-        validated = first(response, "email_validated")
-        status = first(response, "email_validation_status")
+        validated = result.get("email_validated")
+        status = result.get("email_validation_status")
         status = "verified" if validated is True else VERDICTS.get(str(status).lower(), "unknown")
         return Finding(prospect_id=person["prospect_id"], provider=self.name, email=email,
                        email_status=status, confidence=0.9 if validated else 0.6,
@@ -123,11 +120,12 @@ class DeeplineEnricher:
             return None
         payload = {"email": person["email"]}
         response = self._run("tool", self.settings["verify_tool"], payload)
-        verdict = first(response, "result", "email_status")
-        if verdict is None:
+        raw = (response.get("toolResponse") or {}).get("rawV2") or {}
+        verdict = raw.get("result")
+        if not isinstance(verdict, str):
             return None
         return Finding(prospect_id=person["prospect_id"], provider=self.name,
                        email=person["email"],
-                       email_status=VERDICTS.get(str(verdict).lower(), "unknown"),
-                       confidence=(first(response, "score") or 0) / 100 or None,
+                       email_status=VERDICTS.get(verdict.lower(), "unknown"),
+                       confidence=(raw.get("score") or 0) / 100 or None,
                        request=payload, response=response)  # fmt: skip
