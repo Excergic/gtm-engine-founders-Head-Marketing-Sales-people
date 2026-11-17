@@ -807,8 +807,12 @@ def enrich_run(
         batches, errors = 0, []
         for start in range(0, len(ids), limit):
             chunk = ids[start : start + limit]
-            result = run_waterfall(conn, chunk, waterfall, enrichers, dry_run=dry_run,
-                                   only=selected)  # fmt: skip
+            # A fresh connection per batch; run_waterfall reconnects if one drops mid-batch.
+            with warehouse_connection() as batch_conn:
+                result = run_waterfall(batch_conn, chunk, waterfall, enrichers,
+                                       dry_run=dry_run, only=selected,
+                                       connect=warehouse_connection,
+                                       journal_dir=runs_dir / "findings")  # fmt: skip
             batches += 1
             if not dry_run:
                 path = runs_dir / f"{stamp}_batch{batches:03d}.json"

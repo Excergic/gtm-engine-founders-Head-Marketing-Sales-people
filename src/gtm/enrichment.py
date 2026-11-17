@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -297,9 +298,30 @@ def run_waterfall(
     *,
     dry_run: bool = False,
     only: set[str] | None = None,
+    connect: Callable[[], psycopg.Connection] | None = None,
+    journal_dir: Path | None = None,
 ) -> dict:
-    """LinkedIn URL -> email -> verify. Each provider sees only people still missing the field."""
-    conn.autocommit = True
+    """LinkedIn URL -> email -> verify. Each provider sees only people still missing the field.
+
+    Provider calls can take minutes, long enough for a serverless database to drop an idle
+    connection. With ``connect``, a dropped connection is replaced before each database step.
+    With ``journal_dir``, every provider's findings are written to a file before they are
+    applied, so paid results survive any database failure (replay: ``gtm enrich apply``).
+    """
+
+    def live() -> psycopg.Connection:
+        nonlocal conn
+        try:
+            conn.autocommit = True
+            conn.execute("select 1")
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            if connect is None:
+                raise
+            conn = connect()
+            conn.autocommit = True
+        return conn
+
+    live()
     run = None
     if not dry_run:
         run = conn.execute(
@@ -311,7 +333,7 @@ def run_waterfall(
         for name in waterfall.get(stage, []):
             if only and name not in only:
                 continue
-            people = [p for p in current_people(conn, ids) if needs(p, stage)]
+            people = [p for p in current_people(live(), ids) if needs(p, stage)]
             step = {"stage": stage, "provider": name, "asked": len(people)}
             if dry_run:
                 # Planning only: never call a provider (calls can spend credits).
@@ -319,11 +341,16 @@ def run_waterfall(
             elif people and stage in enrichers[name].stages:
                 findings = enrichers[name].find(stage, people)
                 errors += [e for p in people for e in p.get("errors", [])]
-                result = apply_findings(conn, findings, dry_run=dry_run, run_id=run)
+                if journal_dir and findings:
+                    journal_dir.mkdir(parents=True, exist_ok=True)
+                    (journal_dir / f"{run}_{stage}_{name}.json").write_text(json.dumps(
+                        {"findings": [f.model_dump(mode="json") for f in findings]},
+                        indent=2, default=str))  # fmt: skip
+                result = apply_findings(live(), findings, dry_run=dry_run, run_id=run)
                 step.update(found=len(findings), counts=result["counts"])
                 errors += result["problems"]
             steps.append(step)
-    layers = Counter(p["layer"] for p in current_people(conn, ids))
+    layers = Counter(p["layer"] for p in current_people(live(), ids))
     if run:
         conn.execute(
             "update ops.pipeline_runs set finished_at = now(), status = %s, rows_in = %s,"

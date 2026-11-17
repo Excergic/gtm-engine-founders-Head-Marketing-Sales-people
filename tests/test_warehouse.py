@@ -875,3 +875,41 @@ def test_waterfall_asks_each_provider_only_for_whats_still_missing(db):
     assert db.execute("select count(distinct run_id) from core.enrichment").fetchone() == (
         1,
     )  # one run for the whole waterfall
+
+
+def test_waterfall_survives_a_dropped_connection_and_journals_findings(db, tmp_path):
+    """Neon suspends idle computes; a slow provider call must not lose paid results."""
+    from gtm.enrichment import FileEnricher, Finding, run_waterfall
+
+    pid = register(db, name="Ann Lee", linkedin_url=linkedin("ann"))
+    dsn = db.info.dsn
+    work = psycopg.connect(dsn)
+    opened = []
+
+    def connect():
+        opened.append(psycopg.connect(dsn))
+        return opened[-1]
+
+    class Slow:
+        name, stages = "slow", frozenset({"email"})
+
+        def find(self, stage, people):
+            work.close()  # the database drops the connection while the provider works
+            return [Finding(prospect_id=p["prospect_id"], provider="slow", email="ann@a.com",
+                            email_status="verified") for p in people]  # fmt: skip
+
+    journal = tmp_path / "findings"
+    result = run_waterfall(work, [str(pid)], {"email": ["slow"]}, {"slow": Slow()},
+                           connect=connect, journal_dir=journal)  # fmt: skip
+    assert len(opened) == 1 and result["errors"] == []
+    assert layer_of(db, pid) == "golden"
+    (saved,) = journal.glob("*_email_slow.json")
+    assert [f.email for f in FileEnricher(saved).enrich([])] == ["ann@a.com"]
+    for conn in opened:
+        conn.close()
+
+    # Without a way to reconnect the failure is raised, never swallowed.
+    lost = psycopg.connect(dsn)
+    lost.close()
+    with pytest.raises(psycopg.OperationalError):
+        run_waterfall(lost, [str(pid)], {"email": ["slow"]}, {"slow": Slow()})
