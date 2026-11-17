@@ -26,3 +26,13 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Never committed or pushed: local notes and recordings
+HANDOFF.md
+videos/
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
+*.m4v
