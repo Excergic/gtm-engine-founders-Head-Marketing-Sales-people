@@ -96,7 +96,7 @@ class Schedule:
         spec = plistlib.loads(self.plist_path.read_bytes())
         when = spec.get("StartCalendarInterval", {})
         done = self._launchctl("print", f"{self.domain}/{LABEL}")
-        last_exit = re.search(r"last exit code = (\S+)", done.stdout or "")
+        last_exit = re.search(r"last exit code = ([^\n]+)", done.stdout or "")
         return {"installed": True, "loaded": done.returncode == 0,
                 "runs_daily_at": f"{when.get('Hour', 0):02d}:{when.get('Minute', 0):02d}",
                 "last_exit_code": last_exit.group(1) if last_exit else None,
