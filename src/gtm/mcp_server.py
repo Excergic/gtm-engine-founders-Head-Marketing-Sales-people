@@ -156,6 +156,13 @@ def prospect(conn, name_or_id: str) -> dict:
     attempts = conn.execute(
         "select stage, provider, outcome, error, attempted_at from ops.enrichment_latest"
         " where prospect_id = %s order by stage", (pid,)).fetchall()  # fmt: skip
+    research = conn.execute(
+        "select researched_at, role_history, stated_priorities, personalization_hooks,"
+        " sources, confidence from core.person_research where prospect_id = %s"
+        " order by researched_at desc limit 1", (pid,)).fetchall()  # fmt: skip
+    tasks = conn.execute(
+        "select type, status, rule, due_at from outbound.tasks where prospect_id = %s"
+        " order by created_at desc", (pid,)).fetchall()  # fmt: skip
     history = conn.execute(
         "select at, from_layer, to_layer, from_state, to_state, reason from ops.state_transitions"
         " where prospect_id = %s order by transition_id", (pid,)).fetchall()  # fmt: skip
@@ -166,6 +173,7 @@ def prospect(conn, name_or_id: str) -> dict:
             "do_not_contact", "notes")  # fmt: skip
     return {"prospect": _clean([{k: person.get(k) for k in keep}])[0],
             "signals": _clean(signals), "scores": _clean(score),
+            "research": _clean(research), "next_actions": _clean(tasks),
             "enrichment": _clean(enrichment), "enrichment_attempts": _clean(attempts),
             "history": _clean(history)}  # fmt: skip
 
@@ -230,7 +238,8 @@ def build_server():
 
     @server.tool()
     def prospect_detail(name_or_id: str) -> dict:
-        """One person: full record, every signal, ICP score and reasons, which provider
+        """One person: full record, every signal, ICP score and reasons, research with
+        sources (confirmed vs unconfirmed facts), recorded next actions, which provider
         found what, enrichment attempts, and lifecycle history."""
         return run(prospect, name_or_id)
 
