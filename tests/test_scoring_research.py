@@ -377,7 +377,9 @@ def test_new_commands_help_and_technical_profile(system):
         result = runner.invoke(app, command)
         assert result.exit_code == 0, result.output
     profile = system[0].rules["scoring"]["profile"]
-    assert profile["target_roles"] == ["GTM Engineer", "Growth Engineer", "Marketing Engineer"]
+    # The profile describes the sales ICP (founders and GTM leaders), not a job search.
+    assert profile["goal"] == "book_calls_with_icp_buyers"
+    assert {"Founder", "CMO", "CRO"} <= set(profile["target_roles"])
     assert profile["strategy_preference"] == "technical_execution_over_business_strategy"
 
 

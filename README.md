@@ -118,22 +118,61 @@ deepline  email_status        107   (verification verdicts)
 deepline  linkedin_url         45
 ```
 
-### 6. Who to contact today
+### 6. Score against the ICP and open the ready gate
 
-```sql
-select name, title, company, email, linkedin_url, signal, signal_date, outreach_angle
-from golden.prospects
-where not do_not_contact and lead_status = 'open'
-  and signal_date >= to_char(now() - interval '30 days', 'YYYY-MM-DD')
-order by signal_date desc;
+```sh
+uv run gtm icp run
 ```
+
+```json
+{
+  "model_version": "icp-v1",
+  "scored": 374,
+  "tiers": {"tier_1": 223, "tier_2": 143, "tier_3": 8},
+  "golden": 142,
+  "ready": 113,
+  "golden_not_ready_because": {"signal not fresh": 25, "tier_3 (outside ICP)": 4},
+  "lifecycle_moves": {"scraped -> ready": 108, "researched -> ready": 5,
+                      "scraped -> golden": 28, "researched -> golden": 1}
+}
+```
+
+Golden means the data is good. **Ready** means contact them now:
+
+| Ready needs | Why |
+|---|---|
+| Golden, verified email, not do-not-contact, `lead_status = open` | reachable and allowed |
+| Signal 30 days old or less | timing; a stale golden person waits for a new signal |
+| Tier 1 or 2 | in the ICP and worth it |
+| An outreach angle and a source URL | the first message can cite the signal |
+
+The gate runs both ways: when a signal ages past 30 days, a ready person goes back to golden. People already in outbound (`in_sequence`, `replied`, ...) are never moved. Every move is logged in `ops.state_transitions` with the reason.
+
+**ICP score** (`icp:` in `config/gtm.yaml`, written to `core.score_snapshots`):
+
+| Component | Points | Rule |
+|---|---|---|
+| Lead fit | 40 | Founder segment (founder, co-founder, CEO) or GTM leader (C-suite, VP or Head of marketing, sales, content, growth, revenue, GTM). Directors, managers and ICs are outside the ICP and always Tier 3. |
+| Intent | 30 | Signal 30 days old or less and a qualifying kind (funding, launch, new in role, first GTM hire, open roles, expansion); 15 if fresh but another kind |
+| Account fit | 20 | Unscored until ICP account research exists; never guessed |
+| Engagement | 10 | Connected or positive reply; 5 if a connection request is pending |
+
+Tier 1 is 70 or more, Tier 2 is 40 or more.
+
+### 7. Who to contact today
+
+```sh
+uv run gtm icp ready
+```
+
+Lists ready people, best tier and freshest signal first, with their signal, angle and source.
 
 ## How it works
 
 ```text
-Grok CSV ──► raw ──► staging ──► silver ──► golden ──► outbound
-             (append-only)  enrichment waterfall      (drafts, events, deals:
-                            Clay → Deepline            FK to golden only)
+Grok CSV ──► raw ──► staging ──► silver ──► golden ──► ready ──► outbound
+             (append-only)  enrichment waterfall    ICP score + gate   (drafts, events,
+                            Clay → Deepline         fresh signal       deals: FK to golden)
 ```
 
 | Layer | Rule |
@@ -199,6 +238,8 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 | `gtm enrich batch --limit 25` | Pick people missing LinkedIn or a verified email; write a request file. |
 | `gtm enrich run [--request FILE \| --all] [--only PROVIDER] [--dry-run] [--resume]` | Run the waterfall and write results to the warehouse. |
 | `gtm enrich apply FILE` | Apply saved findings (replay a journal, or manual results). |
+| `gtm icp run [--dry-run]` | Score everyone against the ICP and move golden people in or out of ready. |
+| `gtm icp ready` | Who to contact now. |
 | `gtm db export-views` / `gtm db apply-edits` | Edit prospects in a spreadsheet and write validated changes back. |
 | `gtm sql "QUERY"` | Read-only SQL, printed as JSON. |
 | `gtm db status` / `gtm db migrate` | Migrations, each in its own transaction, checksummed. |
@@ -206,7 +247,7 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 ## Tests
 
 ```sh
-uv run pytest -q       # 117 tests
+uv run pytest -q       # 119 tests
 uv run ruff check src tests
 uv run ruff format --check src tests
 ```

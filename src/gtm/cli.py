@@ -55,6 +55,10 @@ db_app = typer.Typer(help="Postgres warehouse (DATABASE_URL in .env): migrations
 app.add_typer(db_app, name="db")
 enrich_app = typer.Typer(help="Find missing LinkedIn URLs and verified emails; fill blanks only.")
 app.add_typer(enrich_app, name="enrich")
+icp_app = typer.Typer(
+    help="Score everyone against the ICP and move golden people in or out of ready."
+)
+app.add_typer(icp_app, name="icp")
 
 
 def output(value):
@@ -841,3 +845,40 @@ def enrich_run(
                 break
         output({"people": len(ids), "batches": batches, "found": dict(found),
                 "errors": errors[:50], "error_count": len(errors)})  # fmt: skip
+
+
+@icp_app.command("run")
+@guarded
+def icp_run(
+    dry_run: Annotated[bool, typer.Option(help="show tiers and moves, write nothing")] = False,
+):
+    """Score every prospect (core.score_snapshots), then apply the ready gate to golden."""
+    from . import icp
+
+    settings = Settings.load()
+    with warehouse_connection(attempts=3) as conn:
+        output(icp.run(conn, settings.rules(), dry_run=dry_run))
+
+
+@icp_app.command("ready")
+@guarded
+def icp_ready(limit: Annotated[int, typer.Option(min=1, max=1000)] = 100):
+    """List who is ready to contact, best tier and freshest signal first."""
+    settings = Settings.load()
+    version = settings.rules()["icp"]["model_version"]
+    with warehouse_connection(attempts=3) as conn:
+        rows = conn.execute(
+            "select p.name, p.title, p.company, s.tier, s.total, p.signal_date, p.signal,"
+            " p.outreach_angle, p.source_url"
+            " from golden.prospects p"
+            " join lateral (select tier, total from core.score_snapshots s"
+            "   where s.prospect_id = p.prospect_id and s.model_version = %s"
+            "   order by snapshot_date desc limit 1) s on true"
+            " where p.lifecycle_stage = 'ready'"
+            " order by s.tier, p.signal_date desc, s.total desc limit %s",
+            (version, limit),
+        ).fetchall()
+    keys = ("name", "title", "company", "tier", "total", "signal_date", "signal",
+            "outreach_angle", "source_url")  # fmt: skip
+    output([dict(zip(keys, (str(v) if v is not None else None for v in r), strict=True))
+            for r in rows])  # fmt: skip

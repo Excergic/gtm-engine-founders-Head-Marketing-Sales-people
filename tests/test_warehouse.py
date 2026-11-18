@@ -913,3 +913,91 @@ def test_waterfall_survives_a_dropped_connection_and_journals_findings(db, tmp_p
     lost.close()
     with pytest.raises(psycopg.OperationalError):
         run_waterfall(lost, [str(pid)], {"email": ["slow"]}, {"slow": Slow()})
+
+
+def _icp_rules():
+    from gtm.config import Settings
+
+    return Settings.load().rules()
+
+
+def _golden_person(conn, tag, **overrides):
+    row = {"name": f"{tag.title()} Person", "linkedin_url": linkedin(tag),
+           "outreach_angle": "Congrats on the round; how are you building pipeline?"}  # fmt: skip
+    row.update(overrides)
+    pid = register(conn, **row)
+    update(conn, pid, email=f"{tag}@example.com", email_status="verified")
+    return pid
+
+
+def _stage(conn, pid):
+    return conn.execute(
+        "select lifecycle_stage from core.all_prospects where prospect_id = %s", (pid,)
+    ).fetchone()[0]
+
+
+def test_icp_segments_follow_the_icp():
+    from gtm.icp import segment
+
+    rules = _icp_rules()
+    icp, scoring = rules["icp"], rules["scoring"]
+    assert segment("Co-founder & CTO", icp, scoring) == "founder"
+    assert segment("Founder & Managing Director", icp, scoring) == "founder"
+    assert segment("SVP Global Sales", icp, scoring) == "gtm_leader"
+    assert segment("Chief Revenue Officer", icp, scoring) == "gtm_leader"
+    assert segment("Head of B2B Marketing", icp, scoring) == "gtm_leader"
+    for outside in ("Enterprise Sales Director", "Director of GTM & Strategy",
+                    "Marketing Manager", "Account Executive", "Vice President", None):  # fmt: skip
+        assert segment(outside, icp, scoring) is None, outside
+
+
+def test_ready_gate_scores_everyone_and_moves_only_golden(db):
+    from datetime import date
+
+    from gtm import icp
+
+    today = date(2026, 11, 10)
+    rules = _icp_rules()
+    fresh = _golden_person(db, "fresh", title="Co-founder & CEO", signal="Raised a $9M seed",
+                           signal_date="2026-11-01")  # fmt: skip
+    stale = _golden_person(db, "stale", title="CMO", signal_date="2026-08-01")
+    director = _golden_person(db, "dir", title="Sales Director", signal_date="2026-11-05")
+    no_angle = _golden_person(db, "quiet", title="CRO", signal_date="2026-11-05",
+                              outreach_angle=None)  # fmt: skip
+    silver = register(db, name="Sil Ver", title="CEO", linkedin_url=linkedin("sil"),
+                      signal_date="2026-11-05")  # fmt: skip
+    busy = _golden_person(db, "busy", title="CEO", signal_date="2026-11-05")
+    db.execute("select ops.transition(%s, 'in_sequence', null, 'system', 'test')", (busy,))
+    db.commit()
+
+    plan = icp.run(db, rules, today=today, dry_run=True)
+    assert plan["ready"] == 1 and plan["run_id"] is None
+    assert db.execute("select count(*) from core.score_snapshots").fetchone() == (0,)
+    assert _stage(db, fresh) == "scraped"  # dry run moves nobody
+
+    result = icp.run(db, rules, today=today)
+    assert result["ready"] == 1
+    assert _stage(db, fresh) == "ready"
+    assert _stage(db, stale) == "golden"
+    assert _stage(db, director) == "golden"
+    assert _stage(db, no_angle) == "golden"
+    assert _stage(db, silver) == "scraped"  # not golden: the gate never touches it
+    assert _stage(db, busy) == "in_sequence"  # outbound states are never touched
+    assert result["golden_not_ready_because"] == {
+        "signal not fresh": 1, "tier_3 (outside ICP)": 1, "no outreach angle": 1}  # fmt: skip
+
+    tiers = dict(db.execute(
+        "select prospect_id, tier from core.score_snapshots where model_version = 'icp-v1'"
+    ).fetchall())  # fmt: skip
+    assert len(tiers) == 6  # everyone is scored, silver included
+    assert tiers[fresh] == "tier_1" and tiers[director] == "tier_3"
+    reasons = db.execute(
+        "select to_state, reason from ops.state_transitions where prospect_id = %s"
+        " order by transition_id", (stale,)).fetchall()  # fmt: skip
+    assert reasons[-1] == ("golden", "ready gate: signal not fresh")
+
+    # Re-running the same day is idempotent; once the signal ages out, ready falls back.
+    again = icp.run(db, rules, today=today)
+    assert again["lifecycle_moves"] == {}
+    later = icp.run(db, rules, today=date(2026, 12, 15))
+    assert _stage(db, fresh) == "golden" and later["lifecycle_moves"] == {"ready -> golden": 1}

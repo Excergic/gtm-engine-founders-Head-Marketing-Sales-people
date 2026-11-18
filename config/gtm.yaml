@@ -45,18 +45,19 @@ mappings:
     create_opportunity: [create_opportunity]
     opportunity_stage: [opportunity_stage]
     notes: [notes]
-# Exploratory opportunity-priority policy; not a hiring probability model.
+# Legacy CSV-tracker scoring (gtm score). Kept for the old commands; the warehouse uses
+# the `icp:` block below. The profile now describes the sales ICP, not the old job search.
 scoring:
   model_version: technical-marketing-v1
   profile:
-    goal: remote_full_time_or_contract
-    positioning: Technical builder for marketing and growth teams
-    target_roles: [GTM Engineer, Growth Engineer, Marketing Engineer]
-    technical_work: [API integrations, workflow automation, CRM engineering, data pipelines, Python or SQL, marketing systems, AI-assisted marketing workflows]
-    exclude_roles: [generic AI Engineer, generic Software Engineer, growth strategist, paid-media manager, copywriter, Head of Growth, revenue leader]
+    goal: book_calls_with_icp_buyers
+    positioning: GTM engineering for B2B SaaS founders and marketing, content and sales leaders
+    target_roles: [Founder, Co-founder, CEO, CMO, CRO, Chief Growth Officer, Chief Content Officer, Chief Commercial Officer, VP or Head of Marketing, Sales, Content, Growth, Demand, Revenue, GTM]
+    technical_work: [outbound systems, enrichment pipelines, CRM engineering, workflow automation, marketing systems]
+    exclude_roles: [individual contributors, Directors and below, SDRs, AEs, investors]
     strategy_preference: technical_execution_over_business_strategy
     work_location: unspecified
-    remote_requirement: Confirm worldwide eligibility or leave geography uncertain until location is supplied
+    remote_requirement: not applicable (selling, not job seeking)
     skill_evidence_urls: []
   research_max_age_days: 30
   engagement_max_age_days: 30
@@ -76,6 +77,29 @@ scoring:
     seniority_alone: [cmo, cro, cco, cgo, cco & partner]
     exclude: [intern, assistant, associate, coordinator, analyst]
   relevant_titles: [marketing, growth, content, sales, revenue operations, revops, demand, brand, recruiter, talent]
+# ICP scoring for the warehouse (gtm icp score / gtm icp ready). Components add to 100;
+# a component with no evidence stays unscored (null), never guessed.
+icp:
+  model_version: icp-v1
+  tier1_min: 70
+  tier2_min: 40
+  weights:
+    lead_fit: 40        # title is in the ICP (founder segment or GTM leader)
+    intent: 30          # signal is fresh and is a qualifying kind of signal
+    account_fit: 20     # company stage / fit from ICP account research (not built yet)
+    engagement: 10      # connected or replied
+  signal_max_age_days: 30
+  founder_titles: [founder, co-founder, cofounder, ceo, chief executive]
+  # GTM leaders use scoring.decision_maker_titles + scoring.decision_maker_rule above.
+  # Outside the ICP even when a GTM word appears in the title.
+  exclude_titles: [director, manager, intern, assistant, associate, coordinator, analyst, sdr, bdr, account executive, investor, venture partner]
+  # ICP signals: funding, launch, first GTM hire, new in role, team expansion, job post, outbound pain.
+  qualifying_signals: [posted, returned, rejoined, started, added, adding, raised, raise, raises, funding, investment, invested, seed, series, stealth, launch, launched, launches, hiring, hire, hired, hires, open roles, job post, new, first, joined, joins, appointed, promoted, named, expansion, expanding, scaling, growing, outbound, pipeline]
+  ready:
+    tiers: [tier_1, tier_2]
+    # Ready also needs: golden, verified email, not do-not-contact, lead_status open,
+    # a fresh signal, an outreach angle, and a source URL the angle can cite.
+
 # Enrichment waterfall: each stage asks providers in order, only for people still missing
 # that field. Add a provider: write an adapter in src/gtm/enrichers/, register it, list it here.
 enrichment:
