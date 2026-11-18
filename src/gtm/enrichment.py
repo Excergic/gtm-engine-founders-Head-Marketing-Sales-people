@@ -326,7 +326,7 @@ def run_waterfall(
     if not dry_run:
         run = conn.execute(
             "insert into ops.pipeline_runs (job, details) values ('enrich', %s) returning run_id",
-            (Jsonb({"waterfall": waterfall, "people": len(ids)}),),
+            (Jsonb({"waterfall": waterfall, "people": len(ids), "prospect_ids": list(ids)}),),
         ).fetchone()[0]
     steps, errors = [], []
     for stage in ("linkedin_url", "email", "verify"):

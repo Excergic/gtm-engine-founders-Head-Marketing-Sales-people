@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,8 +42,17 @@ def database_url(explicit: str | None = None) -> str:
     return url
 
 
-def connect(url: str | None = None) -> psycopg.Connection:
-    return psycopg.connect(database_url(url))
+def connect(url: str | None = None, attempts: int = 1) -> psycopg.Connection:
+    """Open a connection. ``attempts`` > 1 retries with backoff (2, 4, 8 ... 30s): a
+    suspended Neon compute or a network blip can refuse the first try."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return psycopg.connect(database_url(url), connect_timeout=15)
+        except psycopg.OperationalError:
+            if attempt == attempts:
+                raise
+            time.sleep(min(2**attempt, 30))
+    raise AssertionError("unreachable")
 
 
 def load_migrations(directory: Path = MIGRATIONS_DIR) -> list[Migration]:

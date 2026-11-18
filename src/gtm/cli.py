@@ -589,14 +589,14 @@ if __name__ == "__main__":
     app()
 
 
-def warehouse_connection():
+def warehouse_connection(attempts: int = 1):
     from dotenv import load_dotenv
 
     from . import warehouse
 
     load_dotenv(Path.cwd() / ".env", interpolate=False)
     try:
-        return warehouse.connect()
+        return warehouse.connect(attempts=attempts)
     except Exception as exc:  # psycopg errors can include the host; keep the message short
         raise RuntimeError(f"cannot connect to the warehouse: {type(exc).__name__}") from exc
 
@@ -775,6 +775,10 @@ def enrich_run(
         bool,
         typer.Option("--all", help="every non-golden prospect once, in batches of --limit"),
     ] = False,
+    resume: Annotated[
+        bool,
+        typer.Option(help="with --all: skip people an enrich run already asked in the last 24h"),
+    ] = False,
 ):
     """Run the configured waterfall: LinkedIn URL -> work email -> verify."""
     import json as _json
@@ -799,6 +803,12 @@ def enrich_run(
 
         # Snapshot the list once so people who stay unfound are not asked again.
         ids = [p["prospect_id"] for p in select_batch(conn, 1_000_000, layer)]
+        if resume:
+            asked = {r[0] for r in conn.execute(
+                "select jsonb_array_elements_text(details->'prospect_ids') from ops.pipeline_runs"
+                " where job = 'enrich' and started_at > now() - interval '24 hours'"
+                " and details ? 'prospect_ids'")}  # fmt: skip
+            ids = [i for i in ids if i not in asked]
         conn.commit()
         runs_dir = settings.data_directory / "enrichment" / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
@@ -808,10 +818,11 @@ def enrich_run(
         for start in range(0, len(ids), limit):
             chunk = ids[start : start + limit]
             # A fresh connection per batch; run_waterfall reconnects if one drops mid-batch.
-            with warehouse_connection() as batch_conn:
+            reconnect = lambda: warehouse_connection(attempts=6)  # noqa: E731
+            with reconnect() as batch_conn:
                 result = run_waterfall(batch_conn, chunk, waterfall, enrichers,
                                        dry_run=dry_run, only=selected,
-                                       connect=warehouse_connection,
+                                       connect=reconnect,
                                        journal_dir=runs_dir / "findings")  # fmt: skip
             batches += 1
             if not dry_run:
