@@ -13,11 +13,14 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from ..enrichment import Finding
-from . import register
+from . import ProviderError, record_failure, register
 from .clay import name_tokens
 
 VERDICTS = {"deliverable": "verified", "risky": "risky", "undeliverable": "invalid",
@@ -25,13 +28,50 @@ VERDICTS = {"deliverable": "verified", "risky": "risky", "undeliverable": "inval
             "catch_all": "risky", "accept_all": "risky"}  # fmt: skip
 
 
-def _cli(args: list[str], timeout: int) -> dict:
-    done = subprocess.run(
-        ["deepline", *args, "--json"], capture_output=True, text=True, timeout=timeout
-    )
-    if done.returncode != 0:
-        raise RuntimeError(f"deepline {args[0]} {args[1]} failed: {done.stderr.strip()[:300]}")
-    return json.loads(done.stdout)
+# Failures a retry cannot fix: stop asking, and stop the run if it is about credits.
+PERMANENT = ("insufficient", "credit", "balance", "payment method", "billing",
+             "unauthorized", "forbidden", "not authenticated", "invalid input",
+             "validation")  # fmt: skip
+
+
+def _error_text(done: subprocess.CompletedProcess) -> str:
+    """The CLI prints its JSON error on stdout and progress logs on stderr."""
+    try:
+        data = json.loads(done.stdout)
+        error = data.get("error") if isinstance(data, dict) else None
+        message = error.get("message") if isinstance(error, dict) else data.get("message")
+        if message:
+            return str(message)
+    except (ValueError, AttributeError):
+        pass
+    tail = [line for line in (done.stderr or "").strip().splitlines() if line.strip()][-2:]
+    return " | ".join(tail) or (done.stdout or "").strip()[-300:] or f"exit {done.returncode}"
+
+
+def _cli(args: list[str], timeout: int, attempts: int = 2, backoff: float = 10.0) -> dict:
+    """Run one deepline command; retry temporary failures with backoff."""
+    label = f"deepline {args[0]} {args[1]}"
+    for attempt in range(1, attempts + 1):
+        try:
+            done = subprocess.run(
+                ["deepline", *args, "--json"], capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            error, retryable = f"timed out after {timeout}s", True
+        else:
+            if done.returncode == 0:
+                try:
+                    return json.loads(done.stdout)
+                except ValueError:
+                    error, retryable = "output was not JSON", True
+            else:
+                error = _error_text(done)
+                retryable = not any(word in error.casefold() for word in PERMANENT)
+        if not retryable or attempt == attempts:
+            suffix = f" (after {attempt} attempts)" if attempt > 1 else ""
+            raise ProviderError(f"{label}: {error[:400]}{suffix}", retryable=retryable)
+        time.sleep(backoff * attempt)
+    raise AssertionError("unreachable")
 
 
 def split_name(name: str) -> tuple[str, str]:
@@ -48,7 +88,8 @@ class DeeplineEnricher:
         self.name = name
         self.settings = settings
         self.timeout = int(settings.get("timeout_seconds", 300))
-        self.runner = runner or _cli
+        attempts = int(settings.get("attempts", 2))
+        self.runner = runner or (lambda args, timeout: _cli(args, timeout, attempts=attempts))
 
     def _run(self, kind: str, ref: str, payload: dict) -> dict:
         if kind == "play":
@@ -73,9 +114,14 @@ class DeeplineEnricher:
             first_name, last_name = split_name(person["name"])
             try:
                 finding = getattr(self, f"_{stage}")(person, first_name, last_name)
-            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            except ValidationError as exc:
+                # The provider returned a value we refuse (e.g. a malformed email).
                 finding = None
-                person.setdefault("errors", []).append(f"{self.name}.{stage}: {exc}")
+                error = ProviderError(f"rejected value: {exc.errors()[0]['msg']}", retryable=False)
+                record_failure(person, self.name, stage, error)
+            except Exception as exc:  # one person's failure never stops the batch
+                finding = None
+                record_failure(person, self.name, stage, exc)
             if finding:
                 findings.append(finding)
         return findings

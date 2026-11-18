@@ -783,68 +783,50 @@ def enrich_run(
         bool,
         typer.Option(help="with --all: skip people an enrich run already asked in the last 24h"),
     ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(help="retry people whose last attempt failed with a retryable error"),
+    ] = False,
 ):
-    """Run the configured waterfall: LinkedIn URL -> work email -> verify."""
+    """Run the configured waterfall: LinkedIn URL -> work email -> verify.
+
+    Batches are failure-safe: a failed person, provider or batch is recorded in
+    ops.enrichment_attempts and skipped. Retry them later with --retry-failed.
+    """
     import json as _json
-    from datetime import UTC, datetime
 
     from .enrichers import build, waterfall_config
-    from .enrichment import run_waterfall, select_batch
+    from .enrichment import asked_recently, retry_queue, run_batches, run_waterfall, select_batch
 
     settings = Settings.load()
     waterfall, providers = waterfall_config(settings.rules())
     enrichers = {n: build(n, providers[n], settings.data_directory) for n in providers}
     selected = set(only) if only else None
-    with warehouse_connection() as conn:
-        if not all_people:
+    reconnect = lambda: warehouse_connection(attempts=6)  # noqa: E731
+    with reconnect() as conn:
+        if not (all_people or retry_failed):
             if request:
                 ids = [p["prospect_id"] for p in _json.loads(request.read_text())["people"]]
             else:
                 ids = [p["prospect_id"] for p in select_batch(conn, limit, layer)]
             output(run_waterfall(conn, ids, waterfall, enrichers, dry_run=dry_run,
-                                 only=selected))  # fmt: skip
+                                 only=selected, connect=reconnect))  # fmt: skip
             return
-
-        # Snapshot the list once so people who stay unfound are not asked again.
-        ids = [p["prospect_id"] for p in select_batch(conn, 1_000_000, layer)]
-        if resume:
-            asked = {r[0] for r in conn.execute(
-                "select jsonb_array_elements_text(details->'prospect_ids') from ops.pipeline_runs"
-                " where job = 'enrich' and started_at > now() - interval '24 hours'"
-                " and details ? 'prospect_ids'")}  # fmt: skip
-            ids = [i for i in ids if i not in asked]
+        if retry_failed:
+            ids = retry_queue(conn)
+        else:
+            # Snapshot the list once so people who stay unfound are not asked again.
+            ids = [p["prospect_id"] for p in select_batch(conn, 1_000_000, layer)]
+            if resume:
+                asked = asked_recently(conn)
+                ids = [i for i in ids if i not in asked]
         conn.commit()
-        runs_dir = settings.data_directory / "enrichment" / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
-        found: Counter = Counter()
-        batches, errors = 0, []
-        for start in range(0, len(ids), limit):
-            chunk = ids[start : start + limit]
-            # A fresh connection per batch; run_waterfall reconnects if one drops mid-batch.
-            reconnect = lambda: warehouse_connection(attempts=6)  # noqa: E731
-            with reconnect() as batch_conn:
-                result = run_waterfall(batch_conn, chunk, waterfall, enrichers,
-                                       dry_run=dry_run, only=selected,
-                                       connect=reconnect,
-                                       journal_dir=runs_dir / "findings")  # fmt: skip
-            batches += 1
-            if not dry_run:
-                path = runs_dir / f"{stamp}_batch{batches:03d}.json"
-                path.write_text(_json.dumps(result, indent=2, default=str))
-            for step in result["steps"]:
-                found[f"{step['stage']}.{step['provider']}"] += step.get("found") or 0
-            errors += result["errors"]
-            typer.echo(
-                f"batch {batches}: {start + len(chunk)}/{len(ids)} people,"
-                f" layers {result['layers_now']}, errors {len(result['errors'])}",
-                err=True,
-            )
-            if any("credit" in str(e).lower() for e in result["errors"]):
-                typer.echo("stopping: provider reports a credit problem", err=True)
-                break
-        output({"people": len(ids), "batches": batches, "found": dict(found),
-                "errors": errors[:50], "error_count": len(errors)})  # fmt: skip
+    result = run_batches(
+        reconnect, ids, waterfall, enrichers, limit=limit, dry_run=dry_run, only=selected,
+        runs_dir=settings.data_directory / "enrichment" / "runs",
+        log=lambda line: typer.echo(line, err=True),
+    )  # fmt: skip
+    output(result)
 
 
 @icp_app.command("run")

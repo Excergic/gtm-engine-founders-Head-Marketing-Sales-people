@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gtm-warehouse": {
+      "command": "uv",
+      "args": ["run", "--quiet", "gtm-mcp"]
+    }
+  }
+}

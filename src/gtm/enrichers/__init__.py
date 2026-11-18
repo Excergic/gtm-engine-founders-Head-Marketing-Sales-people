@@ -18,11 +18,30 @@ from ..enrichment import Finding
 STAGES = ("linkedin_url", "email", "verify")
 
 
+class ProviderError(RuntimeError):
+    """A provider call failed. ``retryable`` is False for failures a retry cannot fix
+    (no credits, bad credentials, rejected input)."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def record_failure(person: dict, provider: str, stage: str, exc: Exception) -> None:
+    """How adapters report a per-person failure without stopping the batch."""
+    retryable = getattr(exc, "retryable", True)
+    person.setdefault("errors", []).append(f"{provider}.{stage}: {exc}")
+    person.setdefault("failed", {})[(provider, stage)] = retryable
+
+
 class Enricher(Protocol):
     name: str
     stages: frozenset[str]
 
-    def find(self, stage: str, people: list[dict]) -> list[Finding]: ...
+    def find(self, stage: str, people: list[dict]) -> list[Finding]:
+        """Return findings. A failure for one person is reported with
+        ``record_failure`` and must not stop the others."""
+        ...
 
 
 _ADAPTERS: dict[str, Callable[..., Enricher]] = {}

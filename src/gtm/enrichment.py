@@ -290,6 +290,31 @@ def needs(person: dict, stage: str) -> bool:
     return bool(person["email"]) and person["email_status"] not in ("verified", "invalid")
 
 
+def record_attempts(conn, run_id, provider: str, stage: str, people: list[dict],
+                    findings: list[Finding]) -> None:  # fmt: skip
+    """One ops.enrichment_attempts row per person asked: found, miss or error."""
+    if run_id is None:
+        return
+    found = {f.prospect_id for f in findings}
+    rows = []
+    for person in people:
+        key = (provider, stage)
+        if key in person.get("failed", {}):
+            message = next((e for e in reversed(person.get("errors", []))
+                            if e.startswith(f"{provider}.{stage}:")), "failed")  # fmt: skip
+            rows.append((person["prospect_id"], stage, provider, "error", message[:1000],
+                         person["failed"][key], run_id))  # fmt: skip
+        else:
+            outcome = "found" if person["prospect_id"] in found else "miss"
+            rows.append((person["prospect_id"], stage, provider, outcome, None, None, run_id))
+    with conn.cursor() as cur:
+        cur.executemany(
+            "insert into ops.enrichment_attempts (prospect_id, stage, provider, outcome, error,"
+            " retryable, run_id) values (%s, %s, %s, %s, %s, %s, %s)",
+            rows,
+        )
+
+
 def run_waterfall(
     conn: psycopg.Connection,
     ids: list[str],
@@ -308,6 +333,8 @@ def run_waterfall(
     With ``journal_dir``, every provider's findings are written to a file before they are
     applied, so paid results survive any database failure (replay: ``gtm enrich apply``).
     """
+
+    from .enrichers import record_failure  # enrichers imports this module
 
     def live() -> psycopg.Connection:
         nonlocal conn
@@ -339,7 +366,13 @@ def run_waterfall(
                 # Planning only: never call a provider (calls can spend credits).
                 step["would_ask"] = [p["name"] for p in people]
             elif people and stage in enrichers[name].stages:
-                findings = enrichers[name].find(stage, people)
+                try:
+                    findings = enrichers[name].find(stage, people)
+                except Exception as exc:  # a broken provider must not stop the waterfall
+                    findings = []
+                    for person in people:
+                        record_failure(person, name, stage, exc)
+                failed = [p for p in people if (name, stage) in p.get("failed", {})]
                 errors += [e for p in people for e in p.get("errors", [])]
                 if journal_dir and findings:
                     journal_dir.mkdir(parents=True, exist_ok=True)
@@ -347,7 +380,8 @@ def run_waterfall(
                         {"findings": [f.model_dump(mode="json") for f in findings]},
                         indent=2, default=str))  # fmt: skip
                 result = apply_findings(live(), findings, dry_run=dry_run, run_id=run)
-                step.update(found=len(findings), counts=result["counts"])
+                record_attempts(live(), run, name, stage, people, findings)
+                step.update(found=len(findings), failed=len(failed), counts=result["counts"])
                 errors += result["problems"]
             steps.append(step)
     layers = Counter(p["layer"] for p in current_people(live(), ids))
@@ -360,3 +394,115 @@ def run_waterfall(
         )  # fmt: skip
     return {"run_id": str(run) if run else None, "dry_run": dry_run, "steps": steps,
             "layers_now": dict(layers), "errors": errors}  # fmt: skip
+
+
+# ---------------------------------------------------------------------------
+# Running many batches safely
+# ---------------------------------------------------------------------------
+
+STOP_WORDS = ("insufficient", "credit", "balance", "payment method")
+
+
+def asked_recently(conn: psycopg.Connection, hours: int = 24) -> set[str]:
+    """People any enrich run asked in the last ``hours`` (attempts, or older run records)."""
+    rows = conn.execute(
+        "select prospect_id::text from ops.enrichment_attempts"
+        " where attempted_at > now() - make_interval(hours => %(h)s)"
+        " union select jsonb_array_elements_text(details->'prospect_ids') from ops.pipeline_runs"
+        " where job = 'enrich' and started_at > now() - make_interval(hours => %(h)s)"
+        " and details ? 'prospect_ids'",
+        {"h": hours},
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def retry_queue(conn: psycopg.Connection) -> list[str]:
+    """Not-yet-golden people whose latest attempt at some stage was a retryable error."""
+    rows = conn.execute(
+        "select distinct l.prospect_id::text from ops.enrichment_latest l"
+        " join core.all_prospects p using (prospect_id)"
+        " where l.outcome = 'error' and l.retryable is not false"
+        " and p.layer <> 'golden' and not p.do_not_contact"
+        " order by 1"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def run_batches(
+    connect: Callable[[], psycopg.Connection],
+    ids: list[str],
+    waterfall: dict[str, list[str]],
+    enrichers: dict,
+    *,
+    limit: int = 25,
+    dry_run: bool = False,
+    only: set[str] | None = None,
+    runs_dir: Path | None = None,
+    log: Callable[[str], None] = print,
+    max_consecutive_failures: int = 3,
+) -> dict:
+    """Run the waterfall over ``ids`` in batches. A failed person, provider or batch is
+    recorded and skipped; the run stops early only when a provider reports a credit
+    problem or several batches in a row fail (something is down)."""
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%SZ")
+    found: Counter = Counter()
+    failed_people: Counter = Counter()
+    errors: list[str] = []
+    failed_batches: list[dict] = []
+    batches, consecutive, stopped = 0, 0, None
+    for start in range(0, len(ids), limit):
+        chunk = ids[start : start + limit]
+        batches += 1
+        try:
+            with connect() as conn:
+                result = run_waterfall(
+                    conn, chunk, waterfall, enrichers, dry_run=dry_run, only=only,
+                    connect=connect,
+                    journal_dir=runs_dir / "findings" if runs_dir else None,
+                )  # fmt: skip
+        except Exception as exc:  # the batch failed as a whole; keep going
+            consecutive += 1
+            message = f"{type(exc).__name__}: {exc}"[:500]
+            failed_batches.append({"batch": batches, "people": len(chunk), "error": message})
+            log(f"batch {batches}: FAILED ({message}); continuing")
+            _mark_batch_failed(connect, chunk, message)
+            if consecutive >= max_consecutive_failures:
+                stopped = f"{consecutive} batches failed in a row"
+                log(f"stopping: {stopped}")
+                break
+            continue
+        consecutive = 0
+        if runs_dir and not dry_run:
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            path = runs_dir / f"{stamp}_batch{batches:03d}.json"
+            path.write_text(json.dumps(result, indent=2, default=str))
+        for step in result["steps"]:
+            key = f"{step['stage']}.{step['provider']}"
+            found[key] += step.get("found") or 0
+            failed_people[key] += step.get("failed") or 0
+        errors += result["errors"]
+        log(f"batch {batches}: {start + len(chunk)}/{len(ids)} people,"
+            f" layers {result['layers_now']}, errors {len(result['errors'])}")  # fmt: skip
+        if any(word in str(e).lower() for e in result["errors"] for word in STOP_WORDS):
+            stopped = "provider reports a credit problem"
+            log(f"stopping: {stopped}")
+            break
+    return {"people": len(ids), "batches": batches, "found": dict(found),
+            "failed": {k: v for k, v in failed_people.items() if v},
+            "failed_batches": failed_batches, "stopped": stopped,
+            "error_count": len(errors), "errors": errors[:50]}  # fmt: skip
+
+
+def _mark_batch_failed(connect, chunk: list[str], message: str) -> None:
+    """Close the run row a crashed batch left as 'running' (best effort)."""
+    try:
+        with connect() as conn:
+            conn.execute(
+                "update ops.pipeline_runs set status = 'failed', finished_at = now(),"
+                " details = details || %s where job = 'enrich' and status = 'running'"
+                " and details->'prospect_ids' = %s",
+                (Jsonb({"error": message}), Jsonb(chunk)),
+            )
+            conn.commit()
+    except Exception:
+        pass

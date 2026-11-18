@@ -87,7 +87,7 @@ batch 3: 75/360 people, layers {'staging': 1, 'silver': 6, 'golden': 18}, errors
 batch 4: 100/360 people, layers {'staging': 2, 'silver': 2, 'golden': 21}, errors 0
 ```
 
-If a run stops, `--resume` skips people already asked in the last 24 hours. Every paid result is written to `data/enrichment/runs/findings/` before it touches the database, so a dropped connection never loses credits (`gtm enrich apply <file>` replays it).
+Batches are failure-safe. One person's failed lookup, a crashed provider, or a whole failed batch is recorded and skipped; the run carries on and only stops early if a provider reports a credit problem or 3 batches in a row fail. Deepline calls retry temporary failures with backoff and keep the real error message. Every lookup is logged in `ops.enrichment_attempts` as found, miss or error, and `gtm enrich run --retry-failed` re-runs only the retryable errors. If a run stops, `--resume` skips people already asked in the last 24 hours. Every paid result is written to `data/enrichment/runs/findings/` before it touches the database, so a dropped connection never loses credits (`gtm enrich apply <file>` replays it).
 
 ### 5. Where everyone stands
 
@@ -167,6 +167,21 @@ uv run gtm icp ready
 
 Lists ready people, best tier and freshest signal first, with their signal, angle and source.
 
+### 8. Track prospects from any Claude session (MCP)
+
+The repo ships a read-only MCP server, registered in `.mcp.json` as `gtm-warehouse`. Open Claude Code in this folder and ask things like "who's ready to contact?", "show me everything about Lewis", or "what failed in enrichment?".
+
+| Tool | What it returns |
+|---|---|
+| `overview` | People per layer, golden by stage, ICP tiers, retry queue size, latest runs |
+| `ready_list` | Who to reach out to now: email, LinkedIn, signal, angle, source |
+| `golden_list` | Golden people filtered by `ready`, `not_ready` or `stale`, or by name or company |
+| `prospect_detail` | One person: record, every signal, score and reasons, which provider found what, history |
+| `recent_signals` | Signals from the last N days |
+| `failures` | Enrichment lookups that failed, and whether a retry can help |
+
+Connections are opened read-only, so no tool can change data or send anything. Run it yourself with `uv run gtm-mcp`.
+
 ## How it works
 
 ```text
@@ -240,6 +255,8 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 | `gtm enrich apply FILE` | Apply saved findings (replay a journal, or manual results). |
 | `gtm icp run [--dry-run]` | Score everyone against the ICP and move golden people in or out of ready. |
 | `gtm icp ready` | Who to contact now. |
+| `gtm enrich run --retry-failed` | Retry only the lookups whose last attempt failed with a retryable error. |
+| `gtm-mcp` | Read-only MCP server for Claude (see `.mcp.json`). |
 | `gtm db export-views` / `gtm db apply-edits` | Edit prospects in a spreadsheet and write validated changes back. |
 | `gtm sql "QUERY"` | Read-only SQL, printed as JSON. |
 | `gtm db status` / `gtm db migrate` | Migrations, each in its own transaction, checksummed. |
@@ -247,7 +264,7 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 ## Tests
 
 ```sh
-uv run pytest -q       # 119 tests
+uv run pytest -q       # 123 tests
 uv run ruff check src tests
 uv run ruff format --check src tests
 ```

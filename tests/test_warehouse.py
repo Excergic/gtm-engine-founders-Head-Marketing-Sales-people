@@ -158,6 +158,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "0001_layered_warehouse.sql",
         "0002_access_roles.sql",
         "0003_raw_row_outcomes.sql",
+        "0004_enrichment_attempts.sql",
     ]
     assert warehouse.migrate(blank_db) == []
     tables = {
@@ -175,7 +176,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "staging.prospects", "silver.prospects", "golden.prospects",
         "outbound.messages", "outbound.events", "outbound.tasks", "outbound.deals",
         "ops.pipeline_runs", "ops.state_transitions", "ops.ai_outputs", "ops.schema_migrations",
-        "ops.raw_row_outcomes",
+        "ops.raw_row_outcomes", "ops.enrichment_attempts",
     }  # fmt: skip
     assert all(row["state"] == "applied" for row in warehouse.status(blank_db))
 
@@ -1001,3 +1002,179 @@ def test_ready_gate_scores_everyone_and_moves_only_golden(db):
     assert again["lifecycle_moves"] == {}
     later = icp.run(db, rules, today=date(2026, 12, 15))
     assert _stage(db, fresh) == "golden" and later["lifecycle_moves"] == {"ready -> golden": 1}
+
+
+def test_deepline_cli_reads_real_errors_and_retries_only_temporary_ones(monkeypatch):
+    import subprocess
+
+    from gtm.enrichers import ProviderError
+    from gtm.enrichers import deepline as dl
+
+    monkeypatch.setattr(dl.time, "sleep", lambda s: None)
+    calls = []
+
+    def fake(results):
+        def run(cmd, **kw):
+            calls.append(cmd)
+            item = results.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        return run
+
+    def done(code, out="", err=""):
+        return subprocess.CompletedProcess([], code, stdout=out, stderr=err)
+
+    # Temporary failure (error JSON on stdout, logs on stderr), then success.
+    monkeypatch.setattr(dl.subprocess, "run", fake([
+        done(1, '{"ok": false, "error": {"message": "upstream provider 502"}}', "[log] started"),
+        done(0, '{"result": {"email": "a@b.com"}}')]))  # fmt: skip
+    assert dl._cli(["plays", "run", "x"], 5) == {"result": {"email": "a@b.com"}}
+    assert len(calls) == 2
+
+    # No credits: permanent, not retried, and the message is the real one.
+    calls.clear()
+    monkeypatch.setattr(dl.subprocess, "run", fake([
+        done(1, '{"ok": false, "error": {"message": "Insufficient credits"}}')]))  # fmt: skip
+    with pytest.raises(ProviderError, match="Insufficient credits") as err:
+        dl._cli(["plays", "run", "x"], 5)
+    assert err.value.retryable is False and len(calls) == 1
+
+    # Timeouts: retried, then reported as retryable so the retry queue picks it up.
+    monkeypatch.setattr(dl.subprocess, "run", fake([
+        subprocess.TimeoutExpired("deepline", 5), subprocess.TimeoutExpired("deepline", 5)]))  # fmt: skip
+    with pytest.raises(ProviderError, match="timed out after 5s .after 2 attempts") as err:
+        dl._cli(["plays", "run", "x"], 5)
+    assert err.value.retryable is True
+
+
+def test_failures_are_isolated_recorded_and_queued_for_retry(db):
+    from gtm.enrichers import ProviderError, record_failure
+    from gtm.enrichment import Finding, retry_queue, run_waterfall
+
+    ok = register(db, name="Ok Person", linkedin_url=linkedin("ok"))
+    flaky = register(db, name="Flaky Person", linkedin_url=linkedin("flaky"))
+    broke = register(db, name="Broke Person", linkedin_url=linkedin("broke"))
+    nothing = register(db, name="Nothing Person", linkedin_url=linkedin("none"))
+    asked = []
+
+    class Crashes:  # a whole provider blows up
+        name, stages = "crashes", frozenset({"email"})
+
+        def find(self, stage, people):
+            asked.append("crashes")
+            raise RuntimeError("adapter bug")
+
+    class Mixed:  # per person: found, temporary error, permanent error, miss
+        name, stages = "mixed", frozenset({"email"})
+
+        def find(self, stage, people):
+            asked.append(sorted(p["name"] for p in people))
+            out = []
+            for p in people:
+                if p["name"] == "Ok Person":
+                    out.append(Finding(prospect_id=p["prospect_id"], provider="mixed",
+                                       email="ok@a.com", email_status="verified"))  # fmt: skip
+                elif p["name"] == "Flaky Person":
+                    record_failure(p, "mixed", stage, ProviderError("502", retryable=True))
+                elif p["name"] == "Broke Person":
+                    record_failure(p, "mixed", stage, ProviderError("no credits", retryable=False))
+            return out
+
+    ids = [str(ok), str(flaky), str(broke), str(nothing)]
+    result = run_waterfall(db, ids, {"email": ["crashes", "mixed"]},
+                           {"crashes": Crashes(), "mixed": Mixed()})  # fmt: skip
+    # The crash did not stop the next provider, which was still asked about everyone.
+    assert asked == ["crashes", ["Broke Person", "Flaky Person", "Nothing Person", "Ok Person"]]
+    assert layer_of(db, ok) == "golden"
+    steps = {s["provider"]: s for s in result["steps"]}
+    assert steps["crashes"]["failed"] == 4 and steps["mixed"]["failed"] == 2
+
+    outcomes = dict(db.execute(
+        "select prospect_id, outcome || coalesce(':' || retryable::text, '')"
+        " from ops.enrichment_latest where provider = 'mixed'").fetchall())  # fmt: skip
+    assert outcomes == {ok: "found", flaky: "error:true", broke: "error:false", nothing: "miss"}
+    # Retry queue: latest attempt was a retryable error, person not golden. Broke's latest
+    # error on "mixed" is permanent, but the crash on "crashes" left a retryable one.
+    assert set(retry_queue(db)) == {str(flaky), str(broke), str(nothing)}
+    rejected(db, "update ops.enrichment_attempts set outcome = 'found'",
+             match="append-only")  # fmt: skip
+
+
+def test_run_batches_skips_a_failed_batch_and_stops_when_something_is_down(db, tmp_path):
+    from gtm.enrichment import run_batches
+
+    dsn = db.info.dsn
+    ids = [str(register(db, name=f"P{i} Person", linkedin_url=linkedin(f"p{i}"))) for i in range(6)]
+    calls = {"n": 0}
+
+    def connect():
+        calls["n"] += 1
+        if calls["n"] == 1:  # the first batch cannot reach the database
+            raise psycopg.OperationalError("connection refused")
+        return psycopg.connect(dsn)
+
+    class Quiet:
+        name, stages = "quiet", frozenset({"email"})
+
+        def find(self, stage, people):
+            return []
+
+    lines = []
+    result = run_batches(connect, ids, {"email": ["quiet"]}, {"quiet": Quiet()}, limit=2,
+                         runs_dir=tmp_path, log=lines.append)  # fmt: skip
+    assert result["batches"] == 3 and len(result["failed_batches"]) == 1
+    assert result["stopped"] is None
+    assert "FAILED" in lines[0] and lines[-1].startswith("batch 3: 6/6")
+
+    def down():
+        raise psycopg.OperationalError("down")
+
+    result = run_batches(down, ids, {"email": ["quiet"]}, {"quiet": Quiet()}, limit=1,
+                         log=lambda s: None, max_consecutive_failures=2)  # fmt: skip
+    assert result["stopped"] == "2 batches failed in a row" and result["batches"] == 2
+
+    class NoCredits:
+        name, stages = "broke", frozenset({"email"})
+
+        def find(self, stage, people):
+            from gtm.enrichers import ProviderError, record_failure
+
+            for p in people:
+                record_failure(p, "broke", stage,
+                               ProviderError("Insufficient credits", retryable=False))  # fmt: skip
+            return []
+
+    result = run_batches(lambda: psycopg.connect(dsn), ids, {"email": ["broke"]},
+                         {"broke": NoCredits()}, limit=2, log=lambda s: None)  # fmt: skip
+    assert result["stopped"] == "provider reports a credit problem" and result["batches"] == 1
+
+
+def test_mcp_tracking_queries_read_the_ready_list_and_history(db):
+    from datetime import date
+
+    from psycopg.rows import dict_row
+
+    from gtm import icp, mcp_server
+
+    ready = _golden_person(db, "rdy", title="Founder & CEO", signal="Raised a seed round",
+                           signal_date=date.today().isoformat())  # fmt: skip
+    _golden_person(db, "old", title="CMO", signal_date="2025-01-01")
+    icp.run(db, _icp_rules())
+
+    with psycopg.connect(db.info.dsn, row_factory=dict_row,
+                         options="-c default_transaction_read_only=on") as ro:  # fmt: skip
+        rows = mcp_server.ready_to_contact(ro)
+        assert [r["name"] for r in rows] == ["Rdy Person"]
+        assert rows[0]["tier"] == "tier_1" and isinstance(rows[0]["score"], int)
+        assert [r["name"] for r in mcp_server.golden_prospects(ro, status="stale")] == [
+            "Old Person"]  # fmt: skip
+        detail = mcp_server.prospect(ro, str(ready))
+        assert detail["prospect"]["lifecycle_stage"] == "ready"
+        assert detail["history"][-1]["to_state"] == "ready"
+        assert mcp_server.prospect(ro, "Person")["matches"]  # ambiguous name: list matches
+        overview = mcp_server.pipeline_overview(ro)
+        assert {"layer": "golden", "people": 2} in overview["layers"]
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+            ro.execute("update golden.prospects set notes = 'x'")
