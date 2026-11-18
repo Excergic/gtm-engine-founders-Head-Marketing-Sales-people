@@ -1,6 +1,25 @@
 # Exergic Labs GTM engine
 
-Grok finds people with a fresh buying signal. This engine stores every row it receives, enriches each person through a provider waterfall (Clay, then Deepline), and promotes people to **golden** only when they have a verified work email *and* a LinkedIn URL. Outbound works from golden only. Nothing is ever sent automatically.
+Grok finds people with a fresh buying signal. This engine stores every row it receives in a Postgres warehouse, enriches each person through a provider waterfall (Clay, then Deepline), promotes people to **golden** only when they have a verified work email *and* a LinkedIn URL, scores them against the ICP and opens a **ready** list of who to contact now. It runs by itself every day. Nothing is ever sent automatically.
+
+**The warehouse is the only record.** Grok's CSVs are inputs: archived unchanged and stored row by row in `raw`. Nothing is tracked in, exported to, or edited in a CSV.
+
+## Daily, on its own
+
+```sh
+uv run gtm schedule install     # every day at pipeline.run_at (07:30), via launchd
+uv run gtm schedule status
+uv run gtm pipeline             # the same run, by hand; --dry-run to plan only
+```
+
+| Step | Does | If it fails |
+|---|---|---|
+| `import` | New CSVs in `data/incoming/grok/{founders,VPs}/` → `raw` → staging / silver / golden | A bad file is reported and skipped; a file still being written waits for the next run |
+| `enrich` | People never asked before **whose title is in the ICP** → Clay → Deepline (capped at `enrich_max_people`) | A failed person, provider or batch is recorded and skipped; skipped entirely below `min_deepline_credits` |
+| `retry_failed` | Lookups whose last attempt failed with a retryable error | Same as above |
+| `score` | ICP score for everyone; golden people in or out of ready | Recorded; the run is marked partial |
+
+Every step runs even if an earlier one failed. A second run never overlaps a running one. The run and each step's result are stored in `ops.pipeline_runs` (job `pipeline`); output goes to `data/logs/pipeline.log`. The Mac has to be on (a missed run happens on wake).
 
 ## Demo
 
@@ -14,7 +33,7 @@ uv run gtm db import
 
 ```text
 outcome      rows
-migrated      274   people carried over from the old CSV tracker
+migrated      274   people carried over from the old CSV tracker (since removed)
 registered    100   new people
 duplicate      15   identical row already imported
 invalid         7   e.g. signal_date "2026-10 (approx.)" rejected by the 13-column contract
@@ -248,6 +267,8 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 
 | Command | What it does |
 |---|---|
+| `gtm pipeline [--dry-run]` | The daily run: import → enrich new ICP people → retry failures → score. |
+| `gtm schedule install [--at HH:MM]` / `status` / `uninstall` | Run `gtm pipeline` every day (launchd). |
 | `gtm db import` | Load new Grok CSVs into raw and import their people. |
 | `gtm db review` / `gtm db resolve ROW merge\|new\|reject` | Handle possible duplicates. |
 | `gtm enrich batch --limit 25` | Pick people missing LinkedIn or a verified email; write a request file. |
@@ -257,14 +278,13 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 | `gtm icp ready` | Who to contact now. |
 | `gtm enrich run --retry-failed` | Retry only the lookups whose last attempt failed with a retryable error. |
 | `gtm-mcp` | Read-only MCP server for Claude (see `.mcp.json`). |
-| `gtm db export-views` / `gtm db apply-edits` | Edit prospects in a spreadsheet and write validated changes back. |
 | `gtm sql "QUERY"` | Read-only SQL, printed as JSON. |
 | `gtm db status` / `gtm db migrate` | Migrations, each in its own transaction, checksummed. |
 
 ## Tests
 
 ```sh
-uv run pytest -q       # 123 tests
+uv run pytest -q
 uv run ruff check src tests
 uv run ruff format --check src tests
 ```
@@ -274,14 +294,11 @@ Tests run against a throwaway local Postgres (or `TEST_DATABASE_URL`), never Neo
 ## What's next
 
 - **Outbound drafting:** a 3-touch email sequence and LinkedIn note per golden person, written from their signal and research into `outbound.messages`, with an approval queue. Nothing sends without a human.
-- **Scheduling:** import, enrichment and a stuck-prospect report run on a schedule.
+- **Stuck report:** a daily list of people who have sat too long in a state.
 
 ## Rules
 
 - No LinkedIn automation, and no message is ever sent by this code.
+- The warehouse is the only record; CSVs are inputs only.
 - `data/`, `.env`, real CSVs and recordings stay local and are Git-ignored.
 - No email is marked verified without a real deliverability check.
-
-## Older local tracker
-
-The original single-CSV tracker commands (`gtm people`, `gtm daily`, `gtm followups`, `gtm import grok`, `gtm scheduler`, `gtm research`, `gtm score`) still exist. The warehouse replaces them as the record of truth. See [docs/daily-operations.md](docs/daily-operations.md) and [docs/scoring-and-research.md](docs/scoring-and-research.md).

@@ -20,8 +20,6 @@ from datetime import date
 import psycopg
 from psycopg.types.json import Jsonb
 
-from .scoring import matches_rule
-
 # States the gate may move between. Later states (in_sequence, replied, ...) belong to
 # outbound and are never touched here.
 PRE_READY = ("scraped", "researched", "enriched", "silver_waiting", "needs_manual", "golden")
@@ -32,7 +30,20 @@ def _has_word(text: str, terms) -> bool:
     return any(re.search(rf"(?<![a-z]){re.escape(t.casefold())}(?![a-z])", text) for t in terms)
 
 
-def segment(title: str | None, icp: dict, scoring: dict) -> str | None:
+def matches_rule(title: str, rule: dict | None) -> bool:
+    """Seniority x function title rule, e.g. 'SVP Global Sales' or 'Head of B2B Marketing'."""
+    if not rule:
+        return False
+    if _has_word(title, rule.get("exclude", [])):
+        return False
+    if _has_word(title, rule.get("seniority_alone", [])):
+        return True
+    return _has_word(title, rule.get("seniority", [])) and _has_word(
+        title, rule.get("function", [])
+    )
+
+
+def segment(title: str | None, icp: dict) -> str | None:
     """'founder', 'gtm_leader' or None (outside the ICP)."""
     # "Vice President" is a seniority, not the "President" title: read it as "vp" so a
     # bare "Vice President" needs a function to qualify, like any other VP.
@@ -43,8 +54,8 @@ def segment(title: str | None, icp: dict, scoring: dict) -> str | None:
         return "founder"  # "Founder & Managing Director" is still a founder
     if _has_word(text, icp["exclude_titles"]):
         return None
-    if _has_word(text, scoring.get("decision_maker_titles", [])) or matches_rule(
-        text, scoring.get("decision_maker_rule")
+    if _has_word(text, icp.get("gtm_leader_titles", [])) or matches_rule(
+        text, icp.get("gtm_leader_rule")
     ):
         return "gtm_leader"
     return None
@@ -56,11 +67,11 @@ def signal_age(signal_date: str | None, today: date) -> int | None:
     return (today - date.fromisoformat(signal_date)).days
 
 
-def score_person(person: dict, icp: dict, scoring: dict, today: date) -> dict:
+def score_person(person: dict, icp: dict, today: date) -> dict:
     weights = icp["weights"]
     reasons: list[str] = []
 
-    seg = segment(person.get("title"), icp, scoring)
+    seg = segment(person.get("title"), icp)
     lead_fit = weights["lead_fit"] if seg else 0
     reasons.append(f"title {person.get('title')!r}: " + (seg or "outside the ICP"))
 
@@ -134,7 +145,7 @@ COLUMNS = ("prospect_id", "layer", "name", "title", "company", "signal", "signal
 def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
         dry_run: bool = False) -> dict:  # fmt: skip
     """Score everyone, then move golden people in or out of ready."""
-    icp, scoring = rules["icp"], rules.get("scoring", {})
+    icp = rules["icp"]
     today = today or date.today()
     conn.autocommit = True
     people = [dict(zip(COLUMNS, row, strict=True)) for row in conn.execute(
@@ -152,7 +163,7 @@ def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
     moves: Counter = Counter()
     ready_people = []
     for person in people:
-        score = score_person(person, icp, scoring, today)
+        score = score_person(person, icp, today)
         tiers[score["tier"]] += 1
         blockers = ready_blockers(person, score, icp)
         # Only people the gate can move are counted; outbound states are left alone.

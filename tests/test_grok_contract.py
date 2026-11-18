@@ -1,11 +1,15 @@
-"""The Grok CSV contract: 13 columns, validated by the Pydantic Prospect model."""
+"""The Grok CSV contract: 13 columns, validated by the Pydantic Prospect model (the same
+parser the warehouse import uses)."""
 
-import copy
 import csv
+import os
+import time
+from pathlib import Path
 
 import pytest
 
 from gtm.config import Settings
+from gtm.ingestion import parse_csv
 from gtm.models import Prospect, Source
 
 COLUMNS = [
@@ -34,51 +38,47 @@ def grok_row(**overrides):
     return row
 
 
-def write(path, rows):
+def write(path, rows, *, settled=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+    if settled:  # the importer skips files modified in the last minute (still writing)
+        old = time.time() - 600
+        os.utime(path, (old, old))
     return path
 
 
-def test_full_row_maps_every_column(system):
-    service, settings = system
-    result = service.import_file(write(settings.grok_directory / "d.csv", [grok_row()]), "grok")
-    assert result["created"] == 1
-    row = service.store.load()[0]
-    assert row["full_name"] == "Riley Synthetic"
-    assert row["job_title"] == "Chief Revenue Officer"
-    assert row["domain"] == "synthetic-cloud.example"
-    assert row["linkedin_url"] == "https://www.linkedin.com/in/riley-synthetic"
-    assert row["x_handle"] == "@riley_synth"
-    assert row["signal_date"] == "2026-11-01"
-    assert row["source_url"].startswith("https://news.example/")
-    assert row["outreach_angle"].startswith("Offer a signal-based")
-    assert row["needs_review"] == "false"
+def parse(tmp_path, **overrides):
+    mapping = Settings(config_directory=Path(__file__).parents[1] / "config").rules()
+    path = write(tmp_path / "d.csv", [grok_row(**overrides)])
+    (row,) = list(parse_csv(path, Source.grok, mapping["mappings"]["grok"]))
+    return row
 
 
-def test_missing_signal_fields_are_captured_and_flagged(system):
-    service, settings = system
-    path = write(
-        settings.grok_directory / "d.csv", [grok_row(signal="", signal_date="", source_url="")]
-    )
-    assert service.import_file(path, "grok")["created"] == 1
-    row = service.store.load()[0]
-    assert row["needs_review"] == "true"
-    assert "Missing signal fields: signal, signal_date, source_url" in row["review_reason"]
+def test_full_row_maps_every_column(tmp_path):
+    p = parse(tmp_path).prospect
+    assert p.full_name == "Riley Synthetic"
+    assert p.job_title == "Chief Revenue Officer"
+    assert p.domain == "synthetic-cloud.example"
+    assert p.linkedin_url == "https://www.linkedin.com/in/riley-synthetic"
+    assert p.x_handle == "@riley_synth"
+    assert p.signal_date == "2026-11-01"
+    assert str(p.source_url).startswith("https://news.example/")
+    assert p.outreach_angle.startswith("Offer a signal-based")
+
+
+def test_missing_signal_fields_still_parse(tmp_path):
+    # Kept and flagged for review by the import (see test_warehouse), never dropped.
+    p = parse(tmp_path, signal="", signal_date="", source_url="").prospect
+    assert p is not None and not p.signal and not p.signal_date
 
 
 @pytest.mark.parametrize("value,precision", [("2026-10", "month"), ("2026", "year")])
-def test_imprecise_signal_date_is_kept_not_invented(system, value, precision):
-    service, settings = system
-    path = write(settings.grok_directory / "d.csv", [grok_row(signal_date=value)])
-    service.import_file(path, "grok")
-    row = service.store.load()[0]
-    assert row["signal_date"] == value
-    assert row["needs_review"] == "true"
-    assert f"{precision} precision only" in row["review_reason"]
+def test_imprecise_signal_date_is_kept_not_invented(tmp_path, value, precision):
+    p = parse(tmp_path, signal_date=value).prospect
+    assert p.signal_date == value and p.signal_date_precision == precision
 
 
 @pytest.mark.parametrize(
@@ -93,12 +93,9 @@ def test_imprecise_signal_date_is_kept_not_invented(system, value, precision):
         ({"name": "R"}, "full_name"),
     ],
 )
-def test_invalid_values_are_rejected_without_writing(system, overrides, error):
-    service, settings = system
-    path = write(settings.grok_directory / "d.csv", [grok_row(**overrides)])
-    result = service.import_file(path, "grok")
-    assert result["invalid"] == 1 and result["created"] == 0
-    assert result["rows"][0]["error"].startswith(error)
+def test_invalid_values_are_rejected(tmp_path, overrides, error):
+    row = parse(tmp_path, **overrides)
+    assert row.prospect is None and row.error.startswith(error)
 
 
 def test_x_handle_forms_normalize():
@@ -109,8 +106,6 @@ def test_x_handle_forms_normalize():
 
 
 def test_unknown_mapping_field_fails_config_load(tmp_path):
-    from pathlib import Path
-
     import yaml
 
     rules = yaml.safe_load((Path(__file__).parents[1] / "config/gtm.yaml").read_text())
@@ -118,12 +113,3 @@ def test_unknown_mapping_field_fails_config_load(tmp_path):
     (tmp_path / "gtm.yaml").write_text(yaml.safe_dump(rules))
     with pytest.raises(ValueError, match="not in the Prospect model: signl"):
         Settings(config_directory=tmp_path).rules()
-
-
-def test_mapping_edits_do_not_change_import_fingerprints(system):
-    service, settings = system
-    path = write(settings.grok_directory / "d.csv", [grok_row()])
-    before = service.file_key(path, "grok")
-    service.rules = copy.deepcopy(service.rules)
-    service.rules["mappings"]["grok"]["country"] = ["country", "nation"]
-    assert service.file_key(path, "grok") == before

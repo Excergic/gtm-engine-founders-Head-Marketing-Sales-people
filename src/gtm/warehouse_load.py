@@ -1,20 +1,17 @@
-"""One-time load of existing local data into the warehouse.
+"""Raw zone loader: every Grok/LinkedIn input file in ``data/incoming/`` is archived
+unchanged in ``data/raw/YYYY-MM-DD/`` and stored row by row in ``raw.files`` /
+``raw.grok_rows`` (the 13 Grok columns as text). The warehouse is the only record;
+input files are never edited.
 
-- Every original Grok/LinkedIn CSV in the inbox goes to ``data/raw/YYYY-MM-DD/`` unchanged
-  and into ``raw.files`` / ``raw.grok_rows`` (13 Grok columns as text).
-- Every person in the master CSV is registered, keeping their ID, in the layer their data
-  qualifies for, with their signals, company, score snapshot and research.
-
-Idempotent: files already loaded (same SHA-256) and people already registered are skipped,
-so a rerun after a partial failure only adds what is missing.
+Idempotent: a file already loaded (same SHA-256) is skipped.
 """
 
 from __future__ import annotations
 
 import csv
 import hashlib
-import json
 import shutil
+import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,33 +20,15 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from .ingestion import parse_csv
-from .models import Source, normalize_x_handle
+from .models import Source
+
+# A file modified this recently is treated as still being written.
+SETTLE_SECONDS = 60
 
 GROK_COLUMNS = [
     "name", "title", "company", "company_website", "country", "city", "linkedin_url",
     "x_handle", "source_url", "signal", "signal_date", "why_fit", "outreach_angle",
 ]  # fmt: skip
-
-# Master CSV column -> Grok column name used in the warehouse.
-MASTER_TO_GROK = {
-    "full_name": "name",
-    "job_title": "title",
-    "company_name": "company",
-    "website": "company_website",
-    **{c: c for c in GROK_COLUMNS if c not in {"name", "title", "company", "company_website"}},
-}
-
-CONNECTION_STATUS = {
-    "discovered": "none",
-    "connection_sent": "requested",
-    "connection_pending": "requested",
-    "connected": "connected",
-    "conversation_started": "connected",
-    "replied": "connected",
-    "meeting_booked": "connected",
-    "no_response": "requested",
-    "closed": "none",
-}
 
 
 def sha256(path: Path) -> str:
@@ -121,11 +100,21 @@ class Loader:
             for name in [grok_name, *names, canonical]:
                 aliases[name.strip().casefold()] = grok_name
         inbox = self.data_dir / "incoming"
+        now = time.time()
         for path in sorted(inbox.rglob("*.csv")):
+            if now - path.stat().st_mtime < SETTLE_SECONDS:
+                # Probably still being written; the next run picks it up.
+                self.counts["raw_files_skipped_still_writing"] += 1
+                continue
             source = "linkedin" if "linkedin" in path.relative_to(inbox).parts else "grok"
             parent = path.parent.name
             segment = parent if parent in {"founders", "VPs"} else None
-            self._load_file(path, source, segment, aliases, inbox)
+            try:
+                self._load_file(path, source, segment, aliases, inbox)
+            except (OSError, ValueError, csv.Error, psycopg.Error) as exc:
+                # One bad file never stops the others; it is retried on the next run.
+                self.counts["raw_files_failed"] += 1
+                self.problems.append(f"{path.name}: {type(exc).__name__}: {str(exc)[:200]}")
 
     def _load_file(self, path, source, segment, aliases, inbox):
         digest = sha256(path)
@@ -245,214 +234,6 @@ class Loader:
             self.raw_by_content.setdefault(
                 _row_key(dict(zip(GROK_COLUMNS, row[1:], strict=True))), row[0]
             )
-
-    # -- people ---------------------------------------------------------------------
-
-    def load_people(self, master: Path):
-        with master.open(encoding="utf-8-sig", newline="") as file:
-            people = list(csv.DictReader(file))
-        research = self._research_by_domain()
-        for row in people:
-            self.counts["people_in"] += 1
-            pid = row["id"]
-            if self.conn.execute(
-                "select 1 from core.prospect_registry where prospect_id = %s", (pid,)
-            ).fetchone():
-                self.counts["people_already_present"] += 1
-                continue
-            try:
-                with self.conn.transaction():
-                    self._load_person(row, research)
-                self.counts["people_registered"] += 1
-            except ValueError as exc:
-                self.counts["people_failed"] += 1
-                self.problems.append(f"{pid}: invalid value ({str(exc)[:80]})")
-            except psycopg.Error as exc:
-                self.counts["people_failed"] += 1
-                # Keep the database reason, never the person's values.
-                diag = exc.diag
-                self.problems.append(
-                    f"{pid}: {type(exc).__name__} {diag.constraint_name or ''} "
-                    f"{(diag.message_primary or '')[:120]}"
-                )
-
-    def _company(self, row) -> str | None:
-        domain = blank(row.get("domain"))
-        if not domain:
-            return None
-        found = self.conn.execute(
-            "select company_id from core.companies where domain = %s", (domain.lower(),)
-        ).fetchone()
-        if found:
-            return found[0]
-        self.counts["companies"] += 1
-        return self.conn.execute(
-            "insert into core.companies (name, domain, website, original_source)"
-            " values (%s, %s, %s, 'grok') returning company_id",
-            (blank(row.get("company_name")) or domain, domain.lower(), blank(row.get("website"))),
-        ).fetchone()[0]
-
-    def _load_person(self, row, research):
-        pid = row["id"]
-        company_id = self._company(row)
-        prospect = {grok: blank(row.get(master)) for master, grok in MASTER_TO_GROK.items()}
-        prospect = {k: v for k, v in prospect.items() if v is not None}
-        if "x_handle" in prospect:  # older master rows predate handle normalization
-            prospect["x_handle"] = normalize_x_handle(prospect["x_handle"])
-        segments = [s for s in (row.get("segments") or "").split("|") if s]
-        segments = [s.strip() for part in segments for s in part.split(",") if s.strip()]
-        discovered = blank(row.get("discovered_at"))
-        prospect.update(
-            prospect_id=pid,
-            company_id=str(company_id) if company_id else None,
-            segment=sorted(set(segments)),
-            email=(blank(row.get("email")) or "").lower() or None,
-            email_status="unknown",
-            domain=(blank(row.get("domain")) or "").lower() or None,
-            connection_status=CONNECTION_STATUS.get(row.get("connection_status"), "none"),
-            tier=blank(row.get("tier")),
-            score_model_version=blank(row.get("score_model_version")),
-            consulting_stage=blank(row.get("consulting_stage")),
-            job_stage=blank(row.get("job_stage")),
-            do_not_contact=(row.get("do_not_contact") or "").lower() == "true",
-            notes=blank(row.get("notes")),
-            original_source=blank(row.get("original_source")),
-            created_at=discovered,
-        )
-        prospect = {k: v for k, v in prospect.items() if v is not None}
-
-        history = json.loads(row.get("source_data") or "[]")
-        raw_ids = [self.raw_by_content.get(_row_key(entry.get("data", {}))) for entry in history]
-        first_raw = next((r for r in raw_ids if r), None)
-        self.counts["people_linked_to_raw_row" if first_raw else "people_without_raw_row"] += 1
-
-        self.conn.execute(
-            "select ops.register_prospect(%s, %s, 'system', 'migrated from prospects.csv', %s)",
-            (Jsonb(prospect), self.run_id, first_raw),
-        )
-
-        has_outcomes = self.conn.execute(
-            "select to_regclass('ops.raw_row_outcomes') is not null"
-        ).fetchone()[0]
-        if has_outcomes:
-            for raw_id in {r for r in raw_ids if r}:
-                self.conn.execute(
-                    "insert into ops.raw_row_outcomes (raw_row_id, outcome, prospect_id, reason,"
-                    " run_id) values (%s, 'migrated', %s, 'linked during the initial load', %s)"
-                    " on conflict (raw_row_id) do nothing",
-                    (raw_id, pid, self.run_id),
-                )
-
-        # Signals: the current one, plus any different ones in the source history.
-        seen = set()
-        candidates = [(prospect, first_raw, discovered)] + [
-            (entry.get("data", {}), raw_id, entry.get("discovered_at"))
-            for entry, raw_id in zip(history, raw_ids, strict=True)
-        ]
-        for data, raw_id, seen_at in candidates:
-            signal = blank(data.get("signal"))
-            key = (signal, blank(data.get("signal_date")), blank(data.get("source_url")))
-            if not signal or key in seen:
-                continue
-            seen.add(key)
-            self.conn.execute(
-                "insert into core.signals (prospect_id, company_id, raw_row_id, signal,"
-                " signal_date, source_url, why_fit, outreach_angle, source, first_seen_at)"
-                " values (%s, %s, %s, %s, %s, %s, %s, %s, 'grok', coalesce(%s, now()))",
-                (
-                    pid,
-                    company_id,
-                    raw_id,
-                    signal,
-                    blank(data.get("signal_date")),
-                    blank(data.get("source_url")),
-                    blank(data.get("why_fit")),
-                    blank(data.get("outreach_angle")),
-                    seen_at,
-                ),
-            )
-            self.counts["signals"] += 1
-
-        if blank(row.get("tier")) or row.get("score_status") not in (None, "", "needs_research"):
-            self.conn.execute(
-                "insert into core.score_snapshots (prospect_id, snapshot_date, account_fit,"
-                " lead_fit, intent, engagement, total, tier, model_version, reasons)"
-                " values (%s, coalesce(%s::timestamptz::date, current_date), %s, %s, %s, %s,"
-                " %s, %s, %s, %s)",
-                (
-                    pid,
-                    blank(row.get("research_updated_at")),
-                    _num(row.get("account_fit_score")),
-                    _num(row.get("lead_fit_score")),
-                    _num(row.get("hiring_intent_score")),
-                    _num(row.get("engagement_score")),
-                    _num(row.get("full_time_priority")),
-                    blank(row.get("tier")),
-                    blank(row.get("score_model_version")) or "unknown",
-                    Jsonb(
-                        {
-                            "score_status": row.get("score_status"),
-                            "reasons": blank(row.get("score_reasons")),
-                            "evidence_coverage": row.get("evidence_coverage"),
-                        }
-                    ),
-                ),
-            )
-            self.counts["score_snapshots"] += 1
-
-        domain = (blank(row.get("domain")) or "").lower()
-        if blank(row.get("research_updated_at")) and domain in research and company_id:
-            if not self.conn.execute(
-                "select 1 from core.account_research where company_id = %s", (company_id,)
-            ).fetchone():
-                self._account_research(company_id, research[domain])
-            self.conn.execute(
-                "select ops.transition(%s, 'researched', %s, 'system', %s)",
-                (pid, self.run_id, "account research receipt migrated"),
-            )
-            self.counts["people_researched"] += 1
-
-    def _research_by_domain(self) -> dict:
-        receipts = {}
-        for path in sorted((self.data_dir / "research" / "accounts").glob("*.json")):
-            receipt = json.loads(path.read_text())
-            receipts[(receipt.get("domain") or path.stem).lower()] = receipt
-        return receipts
-
-    def _account_research(self, company_id, receipt):
-        sources = sorted(
-            {e["url"] for e in receipt.get("evidence", []) if isinstance(e, dict) and e.get("url")}
-        )
-        self.conn.execute(
-            "insert into core.account_research (company_id, researched_at, findings, sources,"
-            " status, profile_hash) values (%s, %s, %s, %s, %s, %s)",
-            (
-                company_id,
-                receipt.get("researched_at"),
-                Jsonb(receipt),
-                sources,
-                receipt.get("status") or "unknown",
-                receipt.get("profile_hash"),
-            ),
-        )
-        self.counts["account_research"] += 1
-
-
-def load_existing(conn: psycopg.Connection, data_dir: Path, master: Path, rules: dict) -> dict:
-    loader = Loader(conn, data_dir, rules)
-    loader.start()
-    try:
-        loader.load_raw()
-        loader.load_people(master)
-    except Exception as exc:
-        loader.finish("failed", f"{type(exc).__name__}: {str(exc)[:200]}")
-        raise
-    loader.finish("partial" if loader.counts["people_failed"] else "succeeded")
-    return {
-        "run_id": str(loader.run_id),
-        "counts": dict(loader.counts),
-        "problems": loader.problems,
-    }
 
 
 LAYER_COUNTS = """

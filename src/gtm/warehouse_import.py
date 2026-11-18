@@ -10,6 +10,7 @@ Every raw row ends with exactly one outcome in ``ops.raw_row_outcomes``.
 
 from __future__ import annotations
 
+import csv
 from collections import Counter
 from pathlib import Path
 
@@ -71,7 +72,9 @@ class WarehouseImporter:
         except Exception as exc:
             self._finish("failed", f"{type(exc).__name__}: {str(exc)[:200]}")
             raise
-        self._finish("partial" if self.counts["failed"] else "succeeded")
+        self.problems = self.loader.problems + self.problems
+        failed = self.counts["failed"] or self.loader.counts["raw_files_failed"]
+        self._finish("partial" if failed else "succeeded")
         raw = {k: v for k, v in self.loader.counts.items() if k.startswith("raw_")}
         return {
             "run_id": str(self.run_id),
@@ -117,10 +120,17 @@ class WarehouseImporter:
             content = _row_key(dict(zip(GROK_COLUMNS, row[6:], strict=True)))
             if storage not in parsed_files:
                 path = self.data_dir.parent / storage
-                parsed_files[storage] = {
-                    r.number: r.prospect
-                    for r in parse_csv(path, Source.grok, self.rules["mappings"]["grok"])
-                }
+                try:
+                    parsed_files[storage] = {
+                        r.number: r.prospect
+                        for r in parse_csv(path, Source.grok, self.rules["mappings"]["grok"])
+                    }
+                except (OSError, ValueError, csv.Error) as exc:
+                    parsed_files[storage] = None
+                    self.problems.append(f"{storage}: {type(exc).__name__}: {str(exc)[:200]}")
+            if parsed_files[storage] is None:
+                self.counts["failed"] += 1
+                continue
             prospect = parsed_files[storage].get(number)
             try:
                 with self.conn.transaction():

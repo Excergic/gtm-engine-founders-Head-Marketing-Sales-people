@@ -122,19 +122,9 @@ flowchart TB
 
 ### Today
 
-| Data | Where | Queryable? |
-|---|---|---|
-| Raw Grok / LinkedIn files | `data/incoming/` (originals), `data/processed/` (managed snapshots) | file by file |
-| People (current state) | `data/prospects.csv` | yes, in Excel |
-| Per-person history | JSON inside `source_data` / `activity_history` columns | barely |
-| Account research | `data/research/accounts/`, `data/research/history/` | file by file |
-| Import runs, fingerprints | `data/state/local.sqlite` (no contact data) | yes |
-| Master versions | `data/backups/` (last 30) | recovery only |
-| Config | `config/gtm.yaml` (mappings, stages, cadence, ICP rule, weights) | versioned |
-
-**Gap:** one `signal` column per person. A newer signal for an existing person only
-fills blanks, so it is buried in `source_data` and never reaches scoring or outreach.
-Sends and replies are not rows, so "which signal gets replies?" cannot be answered.
+Everything lives in the Neon Postgres warehouse. Grok CSVs are inputs: archived unchanged
+in `data/raw/` and stored row by row in `raw`. There is no CSV master, spreadsheet view or
+local state database.
 
 ### Target: layered warehouse (raw → staging → silver → golden)
 
@@ -401,13 +391,12 @@ stateDiagram-v2
 | `gtm db migrate` / `gtm db status` | Apply / list numbered migrations |
 | `gtm db import` | New inbox CSVs → `data/raw/YYYY-MM-DD/` and `raw` → people, one outcome per row |
 | `gtm db review` / `gtm db resolve <raw_row_id> merge\|new\|reject` | Work the review queue |
-| `gtm db export-views` | Write `data/views/prospects.csv`, `companies.csv`, `deals.csv` |
-| `gtm db apply-edits` | Validate edits in `data/views/prospects.csv`; write back in one transaction |
-| `gtm db load-existing` | One-time load of the old master CSV and inbox files |
+| `gtm enrich run [--all --resume \| --retry-failed]` | Enrichment waterfall, failure-safe batches |
+| `gtm icp run` / `gtm icp ready` | ICP score + ready gate / today's list |
+| `gtm pipeline` | The daily run: import -> enrich new ICP people -> retry failures -> score |
+| `gtm schedule install\|status\|uninstall` | Run `gtm pipeline` daily (launchd) |
 | `gtm sql "<query>"` | Read-only query |
-
-In the view, signal columns are read-only (signals are append-only history) and a row
-changed in the warehouse after export is refused, so edits never overwrite newer data.
+| `gtm-mcp` | Read-only MCP server over the warehouse for Claude |
 
 ### Enrichment providers (pluggable waterfall)
 
@@ -446,17 +435,11 @@ verifier runs.
 - Weekly feedback: winning signal types go into `docs/grok-brief.md`; score weights in
   `config/gtm.yaml` are tuned from observed outcomes.
 
-### Migration
+### Migration (done)
 
-Current `prospects.csv` columns map onto `prospects`, `companies`, and `signals`, renamed
-to the Grok contract (`full_name` → `name`, `job_title` → `title`, `company_name` →
-`company`, `website` → `company_website`). `signal`, `signal_date`, `source_url`,
-`why_fit`, `outreach_angle` become each person's first signal row; `source_data` history
-is replayed into further signal rows. Each person is placed in `staging`, `silver` or
-`golden` by the promotion rules. Original Grok files are loaded into `raw`.
-`activity_history` becomes `events`. Existing IDs become `prospect_id`. The old CSV stays
-readable. The migration runs on a Neon branch first, with row counts per layer before and
-after.
+The old CSV tracker (`data/prospects.csv`, its SQLite state and spreadsheet views) was
+loaded into the warehouse on 2026-11-16 (274 people, outcome `migrated`) and then removed
+from the code. The warehouse is the only record.
 
 ## Outbound design (planned)
 
@@ -472,35 +455,37 @@ after.
 
 ## Scheduling
 
+`gtm schedule install` runs `gtm pipeline` daily at `pipeline.run_at` (launchd; a missed
+run happens when the Mac wakes). Each step is isolated: a failed step is recorded and the
+next one still runs. Paid enrichment is capped (`pipeline.enrich_max_people`) and skipped
+below `pipeline.min_deepline_credits`. The run and each step's result are stored in
+`ops.pipeline_runs` (job `pipeline`).
+
 | Job | Today | Planned |
 |---|---|---|
 | Grok sourcing | Grok scheduled task | same |
-| Import | macOS LaunchAgent every 15 min (`gtm scheduler install`) | GitHub Actions cron |
-| Enrichment + research of new accounts | manual | nightly after import |
-| Draft generation | — | nightly, into approval queue |
-| Booking webhooks | — | Cal.com/Calendly → events, instantly |
-| Stuck report | — | daily, emailed with the briefing |
-| Reply sync | — | every 30 min |
-| Daily briefing | `gtm daily` | pushed to email or Slack |
+| Import, enrichment, retries, ICP score, ready gate | daily `gtm pipeline` | same, or a hosted cron |
+| Draft generation | — | after the ready gate, into an approval queue |
+| Reply sync, booking webhooks | — | planned with outbound |
+| Stuck report | — | daily |
 
 ## Guarantees
 
-- **Idempotent imports.** Files and rows are fingerprinted; rerunning or re-dropping the
-  same file never creates duplicates. Originals stay untouched in the inbox.
-- **Crash-safe writes.** Master is written to a temp file, fsynced, and atomically
-  replaced, with a backup taken first. Each row is committed to the CSV before its
-  checkpoint, so a crash can't double-create.
+- **Idempotent imports.** Files are identified by SHA-256 and folder; rerunning or
+  re-dropping the same file never creates duplicates. Originals stay untouched.
+- **One record.** The warehouse is the only store. Every write is a transaction; raw,
+  signals, attempts and transitions are append-only.
 - **Conservative identity.** Only exact email or normalized LinkedIn URL auto-merge.
   Name + company only suggests a duplicate for review.
-- **Manual edits win.** New observations fill blanks and append notes; they never
-  overwrite user-entered values.
-- **Explainable scores.** The model gathers cited evidence; fixed, versioned Python rules
-  compute the score. Profile or policy changes invalidate cached judgments.
-- **Humans own outcomes.** Replies, acceptances, and sends are observed events, never
-  model output. DNC excludes a person from all actions.
-- **Nothing on air.** Every job, AI output, and state change is logged with a run ID.
-- **Private by default.** Prospect data, state, research, and `.env` are git-ignored; the
-  portfolio report exports aggregates only.
+- **Fill blanks only.** Providers and new imports never overwrite an existing value.
+- **Failure isolation.** A bad file, a failed lookup, a crashed provider, a failed batch
+  or a failed pipeline step is recorded and skipped; the rest carries on.
+- **Explainable scores.** Fixed, versioned rules (`icp-v1`) compute the score; reasons
+  are stored with every snapshot.
+- **Humans own outcomes.** Nothing is sent by this code. DNC excludes a person from all
+  actions.
+- **Nothing off the record.** Every job and state change is logged with a run ID.
+- **Private by default.** `data/`, `.env` and recordings are git-ignored.
 
 ## Roadmap
 

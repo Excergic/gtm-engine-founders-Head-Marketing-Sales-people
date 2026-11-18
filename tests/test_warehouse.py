@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -159,6 +160,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "0002_access_roles.sql",
         "0003_raw_row_outcomes.sql",
         "0004_enrichment_attempts.sql",
+        "0005_pipeline_runs.sql",
     ]
     assert warehouse.migrate(blank_db) == []
     tables = {
@@ -418,80 +420,17 @@ def test_unknown_columns_are_refused(db):
 # --- loading existing local data -------------------------------------------------------
 
 
-def test_load_existing_places_people_and_keeps_raw_files(db, system):
-    from test_grok_contract import grok_row, write
-
-    from gtm.warehouse_load import layer_counts, load_existing
-
-    service, settings = system
-    db.commit()
-    path = write(
-        settings.grok_directory / "founders" / "2026-11-01_founders.csv",
-        [
-            grok_row(),
-            grok_row(name="Sam Nolink", linkedin_url="", company_website="https://b.example"),
-            grok_row(name="Bad Date", linkedin_url="", signal_date="last week"),
-        ],
-    )
-    service.import_file(path, "grok")
-    rows = service.store.load()
-    rows[0]["x_handle"] = "riley_synth"  # older master rows store handles without "@"
-    with service.state.lock():
-        service.write_rows(rows)
-    with service.state.lock():  # writes plain-text score_reasons, as the real master has
-        service.write_rows(service.store.load())
-
-    result = load_existing(db, settings.data_directory, settings.tracker, settings.rules())
-    assert result["problems"] == []
-    counts = layer_counts(db)
-    assert counts["raw.files"] == 1
-    assert (counts["raw.grok_rows valid"], counts["raw.grok_rows review"]) == (1, 1)
-    assert counts["raw.grok_rows invalid"] == 1
-    assert (counts["staging.prospects"], counts["silver.prospects"]) == (1, 1)
-    assert counts["golden.prospects"] == 0
-    assert counts["core.signals"] == 2 and counts["core.companies"] == 2
-
-    copied = settings.data_directory / "raw"
-    assert [p.read_bytes() for p in copied.rglob("*.csv")] == [path.read_bytes()]
-    assert (
-        db.execute(
-            "select count(*) from core.prospect_registry where first_raw_row_id is not null"
-        ).fetchone()[0]
-        == 2
-    )
-    silver = db.execute("select name, segment, linkedin_url from silver.prospects").fetchone()
-    assert silver == (
-        "Riley Synthetic",
-        ["founders"],
-        "https://www.linkedin.com/in/riley-synthetic",
-    )
-
-    assert db.execute("select x_handle from silver.prospects").fetchone() == ("@riley_synth",)
-    assert (
-        next(r for r in __import__("csv").DictReader(settings.tracker.open()))["x_handle"]
-        == "riley_synth"
-    )
-
-    rerun = load_existing(db, settings.data_directory, settings.tracker, settings.rules())
-    assert rerun["counts"]["people_already_present"] == 2
-    assert layer_counts(db) == counts
-
-
-# --- importing into the warehouse ---------------------------------------------------------
-
-
 def _import(db, settings):
     from gtm.warehouse_import import WarehouseImporter
 
     return WarehouseImporter(db, settings.data_directory, settings.rules()).run()
 
 
-def test_import_records_one_outcome_per_row_and_follows_identity_rules(db, system):
+def test_import_records_one_outcome_per_row_and_follows_identity_rules(db, settings):
     from test_grok_contract import grok_row, write
 
     from gtm.warehouse_import import resolve, review_queue
 
-    _, settings = system
     db.commit()
     sam = grok_row(name="Sam Nolink", linkedin_url="", company_website="https://b.example")
     write(settings.grok_directory / "VPs" / "2026-11-12_vps.csv", [grok_row(), sam])
@@ -546,99 +485,6 @@ def test_import_records_one_outcome_per_row_and_follows_identity_rules(db, syste
         "select count(*) from core.signals s join staging.prospects p using (prospect_id)"
         " where p.name = 'Sam Nolink'"
     ).fetchone() == (2,)
-
-
-def test_import_after_initial_load_does_not_reimport_loaded_rows(db, system):
-    from test_grok_contract import grok_row, write
-
-    from gtm.warehouse_load import load_existing
-
-    service, settings = system
-    db.commit()
-    path = write(settings.grok_directory / "VPs" / "2026-11-01_vps.csv", [grok_row()])
-    service.import_file(path, "grok")
-    load_existing(db, settings.data_directory, settings.tracker, settings.rules())
-    assert _import(db, settings)["outcomes"] == {}
-    assert db.execute("select outcome from ops.raw_row_outcomes").fetchall() == [("migrated",)]
-
-
-# --- CSV views -----------------------------------------------------------------------------
-
-
-def _view(settings):
-    return settings.data_directory / "views" / "prospects.csv"
-
-
-def _rewrite(path, edit):
-    import csv as _csv
-
-    with path.open(newline="") as file:
-        reader = _csv.DictReader(file)
-        columns, rows = reader.fieldnames, list(reader)
-    for row in rows:
-        edit(row)
-    with path.open("w", newline="") as file:
-        writer = _csv.DictWriter(file, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def test_view_edits_are_validated_and_applied_in_one_transaction(db, system):
-    from gtm.warehouse_views import apply_view_edits, export_views
-
-    _, settings = system
-    pid = register(db, linkedin_url=linkedin("ada"))
-    register(db, name="Bo Other", company="Other Co")
-    db.autocommit = True
-    views = settings.data_directory / "views"
-    assert export_views(db, views)["prospects.csv"] == 2
-
-    def add_email(row):
-        if row["prospect_id"] == str(pid):
-            row["email"] = "Ada@Example.com"
-            row["email_status"] = "verified"
-            row["notes"] = "met at conference"
-
-    _rewrite(_view(settings), add_email)
-    result = apply_view_edits(db, views)
-    assert result["errors"] == [] and result["layers"] == {str(pid): "golden"}
-    assert db.execute(
-        "select email, notes from golden.prospects where prospect_id = %s", (pid,)
-    ).fetchone() == ("ada@example.com", "met at conference")
-
-    # Read-only column edits and stale rows are refused, and nothing is written.
-    export_views(db, views)
-    _rewrite(_view(settings), lambda row: row.update(tier="tier_1", notes="x"))
-    refused = apply_view_edits(db, views)
-    assert refused["applied"] == 0 and any("tier is read-only" in e for e in refused["errors"])
-    assert db.execute("select count(*) from core.all_prospects where notes = 'x'").fetchone() == (
-        0,
-    )
-
-    export_views(db, views)
-    db.execute("select ops.update_prospect(%s, %s, null, 'system', 't')",
-               (pid, Jsonb({"owner": "someone"})))  # fmt: skip
-    _rewrite(_view(settings), lambda row: row.update(notes="stale edit"))
-    stale = apply_view_edits(db, views)
-    assert any("changed in the warehouse after export" in e for e in stale["errors"])
-
-    # A database rule failure rolls back every row in the batch.
-    export_views(db, views)
-
-    def break_one(row):
-        row["notes"] = "batch"
-        if row["name"] == "Bo Other":
-            row["email_status"] = "verified"  # verified without an email: refused
-
-    _rewrite(_view(settings), break_one)
-    with pytest.raises(psycopg.Error):
-        apply_view_edits(db, views)
-    assert db.execute(
-        "select count(*) from core.all_prospects where notes = 'batch'"
-    ).fetchone() == (0,)
-
-
-# --- enrichment -------------------------------------------------------------------------------
 
 
 def test_enrichment_batch_prefers_silver_and_skips_golden_and_dnc(db):
@@ -941,15 +787,16 @@ def test_icp_segments_follow_the_icp():
     from gtm.icp import segment
 
     rules = _icp_rules()
-    icp, scoring = rules["icp"], rules["scoring"]
-    assert segment("Co-founder & CTO", icp, scoring) == "founder"
-    assert segment("Founder & Managing Director", icp, scoring) == "founder"
-    assert segment("SVP Global Sales", icp, scoring) == "gtm_leader"
-    assert segment("Chief Revenue Officer", icp, scoring) == "gtm_leader"
-    assert segment("Head of B2B Marketing", icp, scoring) == "gtm_leader"
+    icp = rules["icp"]
+    assert segment("Co-founder & CTO", icp) == "founder"
+    assert segment("Founder & Managing Director", icp) == "founder"
+    assert segment("SVP Global Sales", icp) == "gtm_leader"
+    assert segment("Chief Revenue Officer", icp) == "gtm_leader"
+    assert segment("Head of B2B Marketing", icp) == "gtm_leader"
     for outside in ("Enterprise Sales Director", "Director of GTM & Strategy",
-                    "Marketing Manager", "Account Executive", "Vice President", None):  # fmt: skip
-        assert segment(outside, icp, scoring) is None, outside
+                    "Marketing Manager", "Account Executive", "Vice President",
+                    "Hiring Manager", "Head of Business Development", None):  # fmt: skip
+        assert segment(outside, icp) is None, outside
 
 
 def test_ready_gate_scores_everyone_and_moves_only_golden(db):
@@ -1178,3 +1025,134 @@ def test_mcp_tracking_queries_read_the_ready_list_and_history(db):
         assert {"layer": "golden", "people": 2} in overview["layers"]
         with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
             ro.execute("update golden.prospects set notes = 'x'")
+
+
+def test_import_skips_files_still_being_written_and_survives_a_bad_file(db, settings):
+    from test_grok_contract import grok_row, write
+
+    write(settings.grok_directory / "VPs" / "good.csv", [grok_row()])
+    write(settings.grok_directory / "VPs" / "fresh.csv", [grok_row(name="Fresh Person",
+          linkedin_url="https://www.linkedin.com/in/fresh")], settled=False)  # fmt: skip
+    bad = settings.grok_directory / "founders" / "bad.csv"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text('name,name\n"unterminated,x\n')  # duplicate headers + broken quoting
+    os.utime(bad, (time.time() - 600, time.time() - 600))
+
+    result = _import(db, settings)
+    assert result["outcomes"] == {"registered": 1}  # the good file still went in
+    assert result["raw"]["raw_files_skipped_still_writing"] == 1
+    assert result["raw"]["raw_files_failed"] == 1
+    assert any("bad.csv" in p for p in result["problems"])
+
+
+class _FakeProvider:
+    def __init__(self, name, emails=None, crash=False):
+        self.name, self.emails, self.crash = name, emails or {}, crash
+        self.stages = frozenset({"linkedin_url", "email", "verify"})
+        self.asked = []
+
+    def find(self, stage, people):
+        from gtm.enrichment import Finding
+
+        self.asked.append((stage, sorted(p["name"] for p in people)))
+        if self.crash:
+            raise RuntimeError("provider down")
+        return [Finding(prospect_id=p["prospect_id"], provider=self.name,
+                        email=self.emails[p["name"]], email_status="verified")
+                for p in people if stage == "email" and p["name"] in self.emails]  # fmt: skip
+
+
+def test_daily_pipeline_runs_every_step_and_records_the_run(db, settings):
+    from gtm.pipeline import run_daily
+
+    dsn = db.info.dsn
+    connect = lambda: psycopg.connect(dsn)  # noqa: E731
+    today = date_today()
+    founder = register(db, name="Fran Founder", title="Co-founder & CEO",
+                       linkedin_url=linkedin("fran"), signal_date=today,
+                       outreach_angle="Congrats on the seed; how is outbound going?")  # fmt: skip
+    register(db, name="Dee Director", title="Sales Director", linkedin_url=linkedin("dee"),
+             signal_date=today)  # fmt: skip
+    clay = _FakeProvider("clay", crash=True)  # a broken provider must not stop anything
+    deepline = _FakeProvider("deepline", emails={"Fran Founder": "fran@a.com"})
+    lines = []
+
+    result = run_daily(settings, connect, credits=lambda: 100.0,
+                       enrichers={"clay": clay, "deepline": deepline, "manual": deepline},
+                       log=lines.append)  # fmt: skip
+    steps = result["steps"]
+    assert steps["import"]["status"] == "ok"
+    # Only the ICP person was sent to paid enrichment; the Director was not.
+    assert ("email", ["Fran Founder"]) in deepline.asked
+    assert all("Dee Director" not in names for _, names in deepline.asked)
+    assert steps["enrich"]["failed"]["email.clay"] == 1  # recorded, not fatal
+    assert layer_of(db, founder) == "golden"
+    assert steps["score"]["status"] == "ok" and steps["score"]["ready"] == 1
+    # The clay crash left a retryable error, so retry_failed picked the person up... but
+    # they are golden now, so the queue is empty.
+    assert steps["retry_failed"]["people"] == 0
+    row = db.execute("select status, details->'steps'->'score'->>'status' from ops.pipeline_runs"
+                     " where job = 'pipeline'").fetchone()  # fmt: skip
+    db.commit()
+    assert row == (result["status"], "ok")
+
+    # Low credits: paid steps are skipped, the free ones still run.
+    low = run_daily(settings, connect, credits=lambda: 1.0, enrichers={"clay": clay,
+                    "deepline": deepline, "manual": deepline}, log=lines.append)  # fmt: skip
+    assert low["steps"]["enrich"]["status"] == "skipped"
+    assert "below" in low["steps"]["enrich"]["reason"]
+    assert low["steps"]["score"]["status"] == "ok"
+
+
+def test_daily_pipeline_never_overlaps_and_closes_crashed_runs(db, settings):
+    from gtm.pipeline import run_daily
+
+    dsn = db.info.dsn
+    db.execute("insert into ops.pipeline_runs (job, status, started_at)"
+               " values ('pipeline', 'running', now() - interval '7 hours')")  # fmt: skip
+    db.execute("insert into ops.pipeline_runs (job, status) values ('pipeline', 'running')")
+    db.commit()
+    result = run_daily(settings, lambda: psycopg.connect(dsn), credits=lambda: 100.0,
+                       enrichers={}, log=lambda s: None)  # fmt: skip
+    assert result["status"] == "skipped"
+    assert db.execute("select status, error_summary from ops.pipeline_runs"
+                      " order by started_at").fetchall() == [
+        ("failed", "did not finish (crashed or killed)"), ("running", None)]  # fmt: skip
+
+
+def test_schedule_installs_a_daily_launchd_job(tmp_path):
+    import plistlib
+
+    from gtm.schedule import LABEL, Schedule, build_plist, parse_time
+
+    assert parse_time("07:30") == (7, 30)
+    with pytest.raises(ValueError, match="HH:MM"):
+        parse_time("7.30pm")
+    spec = build_plist(tmp_path, "06:05", uv="/opt/homebrew/bin/uv")
+    assert spec["StartCalendarInterval"] == {"Hour": 6, "Minute": 5}
+    assert spec["ProgramArguments"][-2:] == ["gtm", "pipeline"]
+
+    calls = []
+
+    def runner(cmd, **kw):
+        calls.append(cmd[1])
+        import subprocess
+
+        return subprocess.CompletedProcess(cmd, 0, stdout="last exit code = 0\n", stderr="")
+
+    schedule = Schedule(tmp_path, home=tmp_path / "home", runner=runner)
+    assert schedule.install("06:05", dry_run=True)["dry_run"] is True
+    assert calls == [] and not schedule.plist_path.exists()
+    schedule.install("06:05")
+    assert calls == ["bootout", "bootstrap"]
+    assert plistlib.loads(schedule.plist_path.read_bytes())["Label"] == LABEL
+    assert schedule.status() == {"installed": True, "loaded": True, "runs_daily_at": "06:05",
+                                 "last_exit_code": "0",
+                                 "log": str(tmp_path.resolve() / "data/logs/pipeline.log")}  # fmt: skip
+    assert schedule.uninstall() == {"uninstalled": True} and not schedule.plist_path.exists()
+
+
+def date_today():
+    from datetime import date
+
+    return date.today().isoformat()
