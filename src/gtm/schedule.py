@@ -1,7 +1,7 @@
 """Run ``gtm pipeline`` every day on this Mac with launchd.
 
 launchd runs the job at ``pipeline.run_at`` (local time). If the Mac is asleep then, it
-runs when the Mac wakes. Output goes to ``data/logs/pipeline.log``; the run itself, with
+runs when the Mac wakes. Output goes to ``~/Library/Logs/exergiclabs-gtm/pipeline.log``; the run itself, with
 each step's outcome, is recorded in ops.pipeline_runs.
 """
 
@@ -36,12 +36,19 @@ def tool_path() -> str:
     return ":".join(dict.fromkeys(dirs))
 
 
+def log_dir() -> Path:
+    return Path.home() / "Library" / "Logs" / "exergiclabs-gtm"
+
+
 def build_plist(project: Path, run_at: str, *, uv: str | None = None) -> dict:
     hour, minute = parse_time(run_at)
     uv = uv or shutil.which("uv")
     if not uv:
         raise RuntimeError("uv not found on PATH")
-    logs = project / "data" / "logs"
+    # Log and start on the internal disk: macOS privacy controls can stop launchd from
+    # opening files on an external volume before the job even starts (exit 78).
+    # uv --directory then moves into the project.
+    logs = log_dir()
     return {
         "Label": LABEL,
         "ProgramArguments": [
@@ -53,7 +60,7 @@ def build_plist(project: Path, run_at: str, *, uv: str | None = None) -> dict:
             "gtm",
             "pipeline",
         ],  # fmt: skip
-        "WorkingDirectory": str(project),
+        "WorkingDirectory": str(Path.home()),
         "StartCalendarInterval": {"Hour": hour, "Minute": minute},
         "EnvironmentVariables": {"PATH": tool_path()},
         "StandardOutPath": str(logs / "pipeline.log"),
@@ -80,7 +87,7 @@ class Schedule:
         spec = build_plist(self.project, run_at)
         if dry_run:
             return {"dry_run": True, "plist": str(self.plist_path), "spec": spec}
-        (self.project / "data" / "logs").mkdir(parents=True, exist_ok=True)
+        log_dir().mkdir(parents=True, exist_ok=True)
         self.plist_path.parent.mkdir(parents=True, exist_ok=True)
         self._launchctl("bootout", f"{self.domain}/{LABEL}")  # replace an older version
         self.plist_path.write_bytes(plistlib.dumps(spec))

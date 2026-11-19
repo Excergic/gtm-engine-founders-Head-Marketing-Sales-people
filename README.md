@@ -19,7 +19,7 @@ uv run gtm pipeline             # the same run, by hand; --dry-run to plan only
 | `retry_failed` | Lookups whose last attempt failed with a retryable error | Same as above |
 | `score` | ICP score for everyone; golden people in or out of ready | Recorded; the run is marked partial |
 
-Every step runs even if an earlier one failed. A second run never overlaps a running one. The run and each step's result are stored in `ops.pipeline_runs` (job `pipeline`); output goes to `data/logs/pipeline.log`. The Mac has to be on (a missed run happens on wake).
+Every step runs even if an earlier one failed. A second run never overlaps a running one. The run and each step's result are stored in `ops.pipeline_runs` (job `pipeline`); output goes to `~/Library/Logs/exergiclabs-gtm/pipeline.log`. The Mac has to be on (a missed run happens on wake).
 
 ## Demo
 

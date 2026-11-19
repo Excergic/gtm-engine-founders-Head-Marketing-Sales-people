@@ -4,7 +4,7 @@ Start with the pipeline's own record:
 
 ```sh
 uv run gtm schedule status                     # installed? last exit code?
-tail -50 data/logs/pipeline.log                # what the last run printed
+tail -50 ~/Library/Logs/exergiclabs-gtm/pipeline.log                # what the last run printed
 uv run gtm sql "select job, status, started_at, error_summary from ops.pipeline_runs order by started_at desc limit 10"
 ```
 

@@ -1131,6 +1131,9 @@ def test_schedule_installs_a_daily_launchd_job(tmp_path):
     spec = build_plist(tmp_path, "06:05", uv="/opt/homebrew/bin/uv")
     assert spec["StartCalendarInterval"] == {"Hour": 6, "Minute": 5}
     assert spec["ProgramArguments"][-2:] == ["gtm", "pipeline"]
+    # launchd must not open files on the (external) project volume before the job starts.
+    assert spec["WorkingDirectory"] == str(Path.home())
+    assert spec["StandardOutPath"].startswith(str(Path.home() / "Library/Logs"))
 
     calls = []
 
@@ -1148,7 +1151,7 @@ def test_schedule_installs_a_daily_launchd_job(tmp_path):
     assert plistlib.loads(schedule.plist_path.read_bytes())["Label"] == LABEL
     assert schedule.status() == {"installed": True, "loaded": True, "runs_daily_at": "06:05",
                                  "last_exit_code": "0",
-                                 "log": str(tmp_path.resolve() / "data/logs/pipeline.log")}  # fmt: skip
+                                 "log": str(Path.home() / "Library/Logs/exergiclabs-gtm/pipeline.log")}  # fmt: skip
     assert schedule.uninstall() == {"uninstalled": True} and not schedule.plist_path.exists()
 
 
