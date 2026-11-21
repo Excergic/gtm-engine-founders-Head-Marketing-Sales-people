@@ -1,5 +1,9 @@
 # Exergic Labs GTM engine
 
+**5-minute walkthrough:** the whole system, from daily lead lists to 50 signal-based cold emails and day 1 results. Prospect names and emails are blurred.
+
+https://github.com/user-attachments/assets/2082319d-a611-4bd4-9d3b-96d83826134a
+
 Grok finds people with a fresh buying signal. This engine stores every row it receives in a Postgres warehouse, enriches each person through a provider waterfall (Clay, then Deepline), promotes people to **golden** only when they have a verified work email *and* a LinkedIn URL, scores them against the ICP and opens a **ready** list of who to contact now. It runs by itself every day. Nothing is ever sent automatically.
 
 **The warehouse is the only record.** Grok's CSVs are inputs: archived unchanged and stored row by row in `raw`. Nothing is tracked in, exported to, or edited in a CSV.
