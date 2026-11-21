@@ -114,6 +114,61 @@ def score_person(person: dict, icp: dict, today: date) -> dict:
             "reasons": reasons}  # fmt: skip
 
 
+GENERIC_WORDS = {
+    "the",
+    "inc",
+    "labs",
+    "lab",
+    "systems",
+    "system",
+    "group",
+    "financial",
+    "credit",
+    "union",
+    "brand",
+    "formerly",
+    "company",
+    "technologies",
+    "tech",
+    "ai",
+    "io",
+    "hq",
+    "health",
+    "solutions",
+    "software",
+    "digital",
+    "global",
+    "data",
+    "capital",
+    "partners",
+    "services",
+    "ratings",
+    "media",
+    "cloud",
+    "security",
+}
+WRONG_DOMAIN = "email domain does not match company"
+OLD_EMPLOYER_LIST = "old-employer-email"
+
+
+def email_matches_company(email: str | None, company: str | None) -> bool:
+    """Does the email's domain look like the company's own? Enrichment verifies that an
+    address delivers, not that it is the current job, so new CROs and CMOs often come back
+    at their previous employer. Grok leaves company_website blank, so compare the domain
+    with the company name."""
+    if not email or "@" not in email or not company:
+        return False
+    host = email.rsplit("@", 1)[1].lower()
+    label = re.sub(r"[^a-z0-9]", "", host.split(".")[0])
+    compact = re.sub(r"[^a-z0-9]", "", company.lower())
+    tokens = [t for t in re.findall(r"[a-z0-9]+", company.lower()) if t not in GENERIC_WORDS]
+    if label and label == compact:  # short names: fal.ai, e2b.dev, 7ai.com
+        return True
+    if len(label) >= 4 and (label in compact or compact in label):
+        return True
+    return any(len(t) >= 5 and t in label for t in tokens)
+
+
 def ready_blockers(person: dict, score: dict, icp: dict) -> list[str]:
     """Why a person is not ready; empty means ready."""
     blockers = []
@@ -121,6 +176,8 @@ def ready_blockers(person: dict, score: dict, icp: dict) -> list[str]:
         blockers.append("not golden")
     if person.get("email_status") != "verified":
         blockers.append("email not verified")
+    elif not email_matches_company(person.get("email"), person.get("company")):
+        blockers.append(WRONG_DOMAIN)
     if person.get("do_not_contact"):
         blockers.append("do not contact")
     if person.get("lead_status") != "open":
@@ -138,7 +195,7 @@ def ready_blockers(person: dict, score: dict, icp: dict) -> list[str]:
 
 
 COLUMNS = ("prospect_id", "layer", "name", "title", "company", "signal", "signal_date",
-           "source_url", "outreach_angle", "email_status", "do_not_contact", "lead_status",
+           "source_url", "outreach_angle", "email", "email_status", "do_not_contact", "lead_status",
            "connection_status", "reply_status", "lifecycle_stage")  # fmt: skip
 
 
@@ -162,6 +219,7 @@ def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
     blocked: Counter = Counter()
     moves: Counter = Counter()
     ready_people = []
+    old_employer: list[dict] = []
     for person in people:
         score = score_person(person, icp, today)
         tiers[score["tier"]] += 1
@@ -172,6 +230,8 @@ def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
                 blocked[b] += 1
             if not blockers:
                 ready_people.append(person["name"])
+            elif blockers == [WRONG_DOMAIN]:
+                old_employer.append(person)
 
         stage = person["lifecycle_stage"]
         target = None
@@ -202,6 +262,10 @@ def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
                              (person["prospect_id"], target, run_id, reason))  # fmt: skip
                 moves[f"{stage} -> {target}"] += 1
 
+    lists = {OLD_EMPLOYER_LIST: len(old_employer)}
+    if not dry_run:
+        lists = sync_list(conn, OLD_EMPLOYER_LIST, old_employer, WRONG_DOMAIN)
+
     if run_id:
         conn.execute(
             "update ops.pipeline_runs set finished_at = now(), status = 'succeeded',"
@@ -213,4 +277,25 @@ def run(conn: psycopg.Connection, rules: dict, *, today: date | None = None,
             "model_version": icp["model_version"], "scored": len(people),
             "tiers": dict(tiers), "golden": golden, "ready": len(ready_people),
             "golden_not_ready_because": dict(blocked.most_common()),
-            "lifecycle_moves": dict(moves)}  # fmt: skip
+            "lifecycle_moves": dict(moves), "lists": lists}  # fmt: skip
+
+
+def sync_list(conn: psycopg.Connection, name: str, people: list[dict], reason: str) -> dict:
+    """Make the active members of an outbound list exactly ``people``: add or re-add who
+    qualifies, stamp removed_at on who no longer does. Nothing is deleted."""
+    ids = [str(p["prospect_id"]) for p in people]
+    with conn.transaction():
+        for p in people:
+            conn.execute(
+                "insert into outbound.list_members (list_name, prospect_id, email, company, reason)"
+                " values (%s, %s, %s, %s, %s) on conflict (list_name, prospect_id) do update"
+                " set email = excluded.email, company = excluded.company,"
+                " reason = excluded.reason, removed_at = null",
+                (name, p["prospect_id"], p.get("email"), p.get("company"), reason),
+            )
+        removed = conn.execute(
+            "update outbound.list_members set removed_at = now() where list_name = %s"
+            " and removed_at is null and not (prospect_id::text = any(%s))",
+            (name, ids),
+        ).rowcount
+    return {name: {"active": len(ids), "removed_now": removed}}

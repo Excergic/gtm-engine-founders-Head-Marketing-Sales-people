@@ -201,6 +201,18 @@ def enrichment_failures(conn, limit: int = 50) -> list[dict]:
     return _clean(rows)
 
 
+def outbound_list(conn, name: str = "old-employer-email", limit: int = 200) -> list[dict]:
+    rows = conn.execute(
+        "select p.name, p.title, l.company, l.email as email_on_file, p.linkedin_url,"
+        " p.signal, p.signal_date, p.source_url, p.outreach_angle, l.reason, l.added_at"
+        " from outbound.list_members l join golden.prospects p using (prospect_id)"
+        " where l.list_name = %s and l.removed_at is null"
+        " order by p.signal_date desc nulls last limit %s",
+        (name, limit),
+    ).fetchall()
+    return _clean(rows)
+
+
 def build_server():
     from mcp.server.fastmcp import FastMCP
 
@@ -247,6 +259,12 @@ def build_server():
     def recent_signals(days: int = 14, layer: str = "golden", limit: int = 100) -> list[dict]:
         """Signals from the last N days, newest first. layer: golden, silver, staging, all."""
         return run(signals_feed, days=days, layer=layer, limit=limit)
+
+    @server.tool()
+    def campaign_list(name: str = "old-employer-email", limit: int = 200) -> list[dict]:
+        """People kept apart from ready for their own campaign. old-employer-email: ready in
+        every way except the verified email is at a previous employer."""
+        return run(outbound_list, name=name, limit=limit)
 
     @server.tool()
     def failures(limit: int = 50) -> list[dict]:

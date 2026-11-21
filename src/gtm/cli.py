@@ -336,3 +336,81 @@ def schedule_uninstall():
     from .schedule import Schedule
 
     output(Schedule(Path.cwd()).uninstall())
+
+
+outbound_app = typer.Typer(
+    help="Signal-based email: pick today's people, store drafts, record confirmed sends."
+    " Nothing here sends."
+)
+app.add_typer(outbound_app, name="outbound")
+
+
+@outbound_app.command("pick")
+@guarded
+def outbound_pick(
+    per_segment: Annotated[int, typer.Option(min=1, max=200)] = 25,
+    list_name: Annotated[
+        str | None, typer.Option("--list", help="pick from a named list, e.g. old-employer-email")
+    ] = None,
+):
+    """Best founders and VPs (one per company) with the signal and offer to use: from the
+    ready list, or from a named list for its own campaign."""
+    from . import outbound
+
+    settings = Settings.load()
+    version = settings.rules()["icp"]["model_version"]
+    with warehouse_connection(attempts=3) as conn:
+        output(outbound.pick(conn, version, per_segment, list_name))
+
+
+@outbound_app.command("lists")
+@guarded
+def outbound_lists(name: Annotated[str | None, typer.Argument()] = None):
+    """Outbound lists kept apart from ready (counts), or one list's active members."""
+    from . import outbound
+
+    with warehouse_connection(attempts=3) as conn:
+        output(outbound.list_members(conn, name) if name else outbound.lists(conn))
+
+
+@outbound_app.command("save")
+@guarded
+def outbound_save(path: Path):
+    """Store drafts from a JSON list (prospect_id, signal_id, offer, company, subject,
+    body). Drafts that break the house style are rejected and listed."""
+    from . import outbound
+
+    items = json.loads(path.read_text())
+    with warehouse_connection(attempts=3) as conn:
+        output(outbound.save_drafts(conn, items))
+
+
+@outbound_app.command("list")
+@guarded
+def outbound_list(status: Annotated[str | None, typer.Option()] = None):
+    """Messages and their status (draft, sent, ...)."""
+    from . import outbound
+
+    with warehouse_connection(attempts=3) as conn:
+        output(outbound.drafts(conn, status))
+
+
+@outbound_app.command("link")
+@guarded
+def outbound_link(message_id: str, thread_id: str):
+    """Remember the Gmail thread a draft was placed in."""
+    from . import outbound
+
+    with warehouse_connection(attempts=3) as conn:
+        outbound.link_draft(conn, message_id, thread_id)
+    output({"message_id": message_id, "thread_id": thread_id})
+
+
+@outbound_app.command("sent")
+@guarded
+def outbound_sent(message_id: str, external_id: Annotated[str | None, typer.Option()] = None):
+    """Record a send confirmed in Gmail: person -> in_sequence, follow-up task in 4 days."""
+    from . import outbound
+
+    with warehouse_connection(attempts=3) as conn:
+        output(outbound.mark_sent(conn, message_id, external_id=external_id))

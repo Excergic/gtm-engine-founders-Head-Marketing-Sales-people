@@ -161,6 +161,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "0003_raw_row_outcomes.sql",
         "0004_enrichment_attempts.sql",
         "0005_pipeline_runs.sql",
+        "0006_outbound_lists.sql",
     ]
     assert warehouse.migrate(blank_db) == []
     tables = {
@@ -177,6 +178,7 @@ def test_migrate_is_idempotent_and_creates_every_table(blank_db):
         "core.person_research", "core.account_research", "core.score_snapshots",
         "staging.prospects", "silver.prospects", "golden.prospects",
         "outbound.messages", "outbound.events", "outbound.tasks", "outbound.deals",
+        "outbound.list_members",
         "ops.pipeline_runs", "ops.state_transitions", "ops.ai_outputs", "ops.schema_migrations",
         "ops.raw_row_outcomes", "ops.enrichment_attempts",
     }  # fmt: skip
@@ -783,6 +785,35 @@ def _stage(conn, pid):
     ).fetchone()[0]
 
 
+def test_old_employer_email_goes_to_its_own_list_not_ready(db):
+    from datetime import date
+
+    from gtm import icp, outbound
+
+    today = date(2026, 11, 10)
+    rules = _icp_rules()
+    moved = _golden_person(db, "moved", title="Chief Revenue Officer", company="FinBursa",
+                           signal="Appointed CRO", signal_date="2026-11-05")  # fmt: skip
+    update(db, moved, email="moved@blackrock.com", email_status="verified")
+    signal_for(db, moved)
+
+    result = icp.run(db, rules, today=today)
+    assert _stage(db, moved) == "golden"  # held out of ready
+    assert result["golden_not_ready_because"] == {icp.WRONG_DOMAIN: 1}
+    assert result["lists"] == {"old-employer-email": {"active": 1, "removed_now": 0}}
+    version = rules["icp"]["model_version"]
+    assert outbound.pick(db, version)["picked"] == []
+    picked = outbound.pick(db, version, list_name="old-employer-email")["picked"]
+    assert [p["email"] for p in picked] == ["moved@blackrock.com"]
+
+    # Their current address turns up: ready again, and off the list (row kept).
+    update(db, moved, email="moved@finbursa.com", email_status="verified")
+    result = icp.run(db, rules, today=today)
+    assert _stage(db, moved) == "ready"
+    assert result["lists"] == {"old-employer-email": {"active": 0, "removed_now": 1}}
+    assert db.execute("select count(*) from outbound.list_members").fetchone() == (1,)
+
+
 def test_icp_segments_follow_the_icp():
     from gtm.icp import segment
 
@@ -1074,7 +1105,7 @@ def test_daily_pipeline_runs_every_step_and_records_the_run(db, settings):
     register(db, name="Dee Director", title="Sales Director", linkedin_url=linkedin("dee"),
              signal_date=today)  # fmt: skip
     clay = _FakeProvider("clay", crash=True)  # a broken provider must not stop anything
-    deepline = _FakeProvider("deepline", emails={"Fran Founder": "fran@a.com"})
+    deepline = _FakeProvider("deepline", emails={"Fran Founder": "fran@examplesaas.com"})
     lines = []
 
     result = run_daily(settings, connect, credits=lambda: 100.0,
