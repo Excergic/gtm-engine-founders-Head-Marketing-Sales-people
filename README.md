@@ -306,3 +306,10 @@ Tests run against a throwaway local Postgres (or `TEST_DATABASE_URL`), never Neo
 - The warehouse is the only record; CSVs are inputs only.
 - `data/`, `.env`, real CSVs and recordings stay local and are Git-ignored.
 - No email is marked verified without a real deliverability check.
+
+## Contact
+
+I build GTM systems like this for startups. If you want one for your team, or you're hiring a GTM engineer, reach out:
+
+- LinkedIn: [linkedin.com/in/dhaivat-jambudia](https://www.linkedin.com/in/dhaivat-jambudia/)
+- X: [@dhaivatnj](https://x.com/dhaivatnj)
