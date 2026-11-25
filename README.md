@@ -283,6 +283,7 @@ For Deepline: `npm install -g deepline && deepline auth register`. Check credits
 | `gtm enrich run --retry-failed` | Retry only the lookups whose last attempt failed with a retryable error. |
 | `gtm-mcp` | Read-only MCP server for Claude (see `.mcp.json`). |
 | `gtm sql "QUERY"` | Read-only SQL, printed as JSON. |
+| `gtm report [--out FILE] [--names] [--days 14]` | One HTML results page anyone can open: leads, emails, invites, replies, meetings, today's new leads. Names hidden unless `--names`. |
 | `gtm db status` / `gtm db migrate` | Migrations, each in its own transaction, checksummed. |
 
 ## Tests
@@ -296,6 +297,8 @@ uv run ruff format --check src tests
 Tests run against a throwaway local Postgres (or `TEST_DATABASE_URL`), never Neon, and use fake providers, so they never spend credits.
 
 ## What's next
+
+Plan for running on a server with automatic reply and acceptance tracking: [docs/automation-plan.md](docs/automation-plan.md).
 
 - **Outbound drafting:** a 3-touch email sequence and LinkedIn note per golden person, written from their signal and research into `outbound.messages`, with an approval queue. Nothing sends without a human.
 - **Stuck report:** a daily list of people who have sat too long in a state.

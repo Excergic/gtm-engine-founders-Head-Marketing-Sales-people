@@ -102,6 +102,30 @@ def sql_command(query: str, limit: Annotated[int, typer.Option(min=1)] = 200):
             output({"rows": rows, "truncated": cur.fetchone() is not None})
 
 
+@app.command("report")
+@guarded
+def report_command(
+    out: Annotated[Path | None, typer.Option(help="Where to write the HTML page")] = None,
+    names: Annotated[
+        bool, typer.Option(help="Show people's names (off: role and company only)")
+    ] = False,
+    days: Annotated[int, typer.Option(min=1, max=90)] = 14,
+):
+    """Write a one-page HTML results report: sends, replies, meetings and today's leads."""
+    import datetime as dt
+
+    from . import report
+
+    today = dt.date.today()
+    with warehouse_connection() as conn:
+        conn.read_only = True
+        page = report.render(report.collect(conn, today, days), show_names=names)
+    out = out or Path("data/reports") / f"results-{today:%Y-%m-%d}.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(page, encoding="utf-8")
+    output({"written": str(out)})
+
+
 @db_app.command("import")
 @guarded
 def db_import():
